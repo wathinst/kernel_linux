@@ -421,7 +421,7 @@ static inline void sctp_skb_set_owner_r(struct sk_buff *skb, struct sock *sk)
 	/*
 	 * This mimics the behavior of skb_set_owner_r
 	 */
-	sk_mem_charge(sk, event->rmem_len);
+	sk->sk_forward_alloc -= event->rmem_len;
 }
 
 /* Tests if the list has one and only one entry. */
@@ -618,16 +618,6 @@ static inline bool sctp_transport_pmtu_check(struct sctp_transport *t)
 	t->pathmtu = pmtu;
 
 	return false;
-}
-
-static inline __u32 sctp_min_frag_point(struct sctp_sock *sp, __u16 datasize)
-{
-	return sctp_mtu_payload(sp, SCTP_DEFAULT_MINSEGMENT, datasize);
-}
-
-static inline bool sctp_newsk_ready(const struct sock *sk)
-{
-	return sock_flag(sk, SOCK_DEAD) || sk->sk_socket;
 }
 
 #endif /* __net_sctp_h__ */

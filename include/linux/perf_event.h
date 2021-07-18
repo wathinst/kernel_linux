@@ -494,11 +494,6 @@ struct perf_addr_filters_head {
 	unsigned int		nr_file_filters;
 };
 
-struct perf_addr_filter_range {
-	unsigned long		start;
-	unsigned long		size;
-};
-
 /**
  * enum perf_event_state - the states of an event:
  */
@@ -675,7 +670,7 @@ struct perf_event {
 	/* address range filters */
 	struct perf_addr_filters_head	addr_filters;
 	/* vma address array for file-based filders */
-	struct perf_addr_filter_range	*addr_filter_ranges;
+	unsigned long			*addr_filters_offs;
 	unsigned long			addr_filters_gen;
 
 	void (*destroy)(struct perf_event *);
@@ -1033,11 +1028,6 @@ static inline int is_software_event(struct perf_event *event)
 static inline int in_software_context(struct perf_event *event)
 {
 	return event->ctx->pmu->task_ctx_nr == perf_sw_context;
-}
-
-static inline int is_exclusive_pmu(struct pmu *pmu)
-{
-	return pmu->capabilities & PERF_PMU_CAP_EXCLUSIVE;
 }
 
 extern struct static_key perf_swevent_enabled[PERF_COUNT_SW_MAX];

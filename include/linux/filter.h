@@ -277,26 +277,6 @@ struct sock_reuseport;
 		.off   = OFF,					\
 		.imm   = IMM })
 
-/* Like BPF_JMP_REG, but with 32-bit wide operands for comparison. */
-
-#define BPF_JMP32_REG(OP, DST, SRC, OFF)			\
-	((struct bpf_insn) {					\
-		.code  = BPF_JMP32 | BPF_OP(OP) | BPF_X,	\
-		.dst_reg = DST,					\
-		.src_reg = SRC,					\
-		.off   = OFF,					\
-		.imm   = 0 })
-
-/* Like BPF_JMP_IMM, but with 32-bit wide operands for comparison. */
-
-#define BPF_JMP32_IMM(OP, DST, IMM, OFF)			\
-	((struct bpf_insn) {					\
-		.code  = BPF_JMP32 | BPF_OP(OP) | BPF_K,	\
-		.dst_reg = DST,					\
-		.src_reg = 0,					\
-		.off   = OFF,					\
-		.imm   = IMM })
-
 /* Unconditional jumps, goto pc + off16 */
 
 #define BPF_JMP_A(OFF)						\
@@ -704,7 +684,6 @@ static inline void bpf_prog_unlock_ro(struct bpf_prog *fp)
 static inline void bpf_jit_binary_lock_ro(struct bpf_binary_header *hdr)
 {
 	set_memory_ro((unsigned long)hdr, hdr->pages);
-	set_memory_x((unsigned long)hdr, hdr->pages);
 }
 
 static inline void bpf_jit_binary_unlock_ro(struct bpf_binary_header *hdr)
@@ -772,12 +751,12 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog);
 void bpf_jit_compile(struct bpf_prog *prog);
 bool bpf_helper_changes_pkt_data(void *func);
 
-static inline bool bpf_dump_raw_ok(const struct cred *cred)
+static inline bool bpf_dump_raw_ok(void)
 {
 	/* Reconstruction of call-sites is dependent on kallsyms,
 	 * thus make dump the same restriction.
 	 */
-	return kallsyms_show_value(cred);
+	return kallsyms_show_value() == 1;
 }
 
 struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
@@ -857,7 +836,6 @@ bpf_run_sk_reuseport(struct sock_reuseport *reuse, struct sock *sk,
 extern int bpf_jit_enable;
 extern int bpf_jit_harden;
 extern int bpf_jit_kallsyms;
-extern long bpf_jit_limit;
 
 typedef void (*bpf_jit_fill_hole_t)(void *area, unsigned int size);
 

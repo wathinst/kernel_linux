@@ -362,9 +362,9 @@ enum v4l2_hsv_encoding {
 
 enum v4l2_quantization {
 	/*
-	 * The default for R'G'B' quantization is always full range.
-	 * For Y'CbCr the quantization is always limited range, except
-	 * for COLORSPACE_JPEG: this is full range.
+	 * The default for R'G'B' quantization is always full range, except
+	 * for the BT2020 colorspace. For Y'CbCr the quantization is always
+	 * limited range, except for COLORSPACE_JPEG: this is full range.
 	 */
 	V4L2_QUANTIZATION_DEFAULT     = 0,
 	V4L2_QUANTIZATION_FULL_RANGE  = 1,
@@ -373,13 +373,14 @@ enum v4l2_quantization {
 
 /*
  * Determine how QUANTIZATION_DEFAULT should map to a proper quantization.
- * This depends on whether the image is RGB or not, the colorspace.
- * The Y'CbCr encoding is not used anymore, but is still there for backwards
- * compatibility.
+ * This depends on whether the image is RGB or not, the colorspace and the
+ * Y'CbCr encoding.
  */
 #define V4L2_MAP_QUANTIZATION_DEFAULT(is_rgb_or_hsv, colsp, ycbcr_enc) \
-	(((is_rgb_or_hsv) || (colsp) == V4L2_COLORSPACE_JPEG) ? \
-	 V4L2_QUANTIZATION_FULL_RANGE : V4L2_QUANTIZATION_LIM_RANGE)
+	(((is_rgb_or_hsv) && (colsp) == V4L2_COLORSPACE_BT2020) ? \
+	 V4L2_QUANTIZATION_LIM_RANGE : \
+	 (((is_rgb_or_hsv) || (colsp) == V4L2_COLORSPACE_JPEG) ? \
+	 V4L2_QUANTIZATION_FULL_RANGE : V4L2_QUANTIZATION_LIM_RANGE))
 
 /*
  * Deprecated names for opRGB colorspace (IEC 61966-2-5)
@@ -521,6 +522,8 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_ARGB32  v4l2_fourcc('B', 'A', '2', '4') /* 32  ARGB-8-8-8-8  */
 #define V4L2_PIX_FMT_XRGB32  v4l2_fourcc('B', 'X', '2', '4') /* 32  XRGB-8-8-8-8  */
 
+#define V4L2_PIX_FMT_RGBA    v4l2_fourcc('R', 'G', 'B', 'A') /* 32  RGBA-8-8-8-8  */
+
 /* Grey formats */
 #define V4L2_PIX_FMT_GREY    v4l2_fourcc('G', 'R', 'E', 'Y') /*  8  Greyscale     */
 #define V4L2_PIX_FMT_Y4      v4l2_fourcc('Y', '0', '4', ' ') /*  4  Greyscale     */
@@ -550,6 +553,7 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_YUV444  v4l2_fourcc('Y', '4', '4', '4') /* 16  xxxxyyyy uuuuvvvv */
 #define V4L2_PIX_FMT_YUV555  v4l2_fourcc('Y', 'U', 'V', 'O') /* 16  YUV-5-5-5     */
 #define V4L2_PIX_FMT_YUV565  v4l2_fourcc('Y', 'U', 'V', 'P') /* 16  YUV-5-6-5     */
+#define V4L2_PIX_FMT_YUV24   v4l2_fourcc('Y', 'U', 'V', '3') /* 24  YUV-8-8-8     */
 #define V4L2_PIX_FMT_YUV32   v4l2_fourcc('Y', 'U', 'V', '4') /* 32  YUV-8-8-8-8   */
 #define V4L2_PIX_FMT_HI240   v4l2_fourcc('H', 'I', '2', '4') /*  8  8-bit color   */
 #define V4L2_PIX_FMT_HM12    v4l2_fourcc('H', 'M', '1', '2') /*  8  YUV 4:2:0 16x16 macroblocks */
@@ -2271,13 +2275,11 @@ struct v4l2_event_subscription {
 /* VIDIOC_DBG_G_REGISTER and VIDIOC_DBG_S_REGISTER */
 
 #define V4L2_CHIP_MATCH_BRIDGE      0  /* Match against chip ID on the bridge (0 for the bridge) */
-#define V4L2_CHIP_MATCH_SUBDEV      4  /* Match against subdev index */
-
-/* The following four defines are no longer in use */
 #define V4L2_CHIP_MATCH_HOST V4L2_CHIP_MATCH_BRIDGE
 #define V4L2_CHIP_MATCH_I2C_DRIVER  1  /* Match against I2C driver name */
 #define V4L2_CHIP_MATCH_I2C_ADDR    2  /* Match against I2C 7-bit address */
 #define V4L2_CHIP_MATCH_AC97        3  /* Match against ancillary AC97 chip */
+#define V4L2_CHIP_MATCH_SUBDEV      4  /* Match against subdev index */
 
 struct v4l2_dbg_match {
 	__u32 type; /* Match type */
@@ -2292,6 +2294,13 @@ struct v4l2_dbg_register {
 	__u32 size;	/* register size in bytes */
 	__u64 reg;
 	__u64 val;
+} __attribute__ ((packed));
+
+/* VIDIOC_DBG_G_CHIP_IDENT */
+struct v4l2_dbg_chip_ident {
+	struct v4l2_dbg_match match;
+	__u32 ident;       /* chip identifier as specified in <media/v4l2-chip-ident.h> */
+	__u32 revision;    /* chip revision, chip specific */
 } __attribute__ ((packed));
 
 #define V4L2_CHIP_FL_READABLE (1 << 0)
@@ -2396,6 +2405,12 @@ struct v4l2_create_buffers {
  */
 #define	VIDIOC_DBG_S_REGISTER	 _IOW('V', 79, struct v4l2_dbg_register)
 #define	VIDIOC_DBG_G_REGISTER	_IOWR('V', 80, struct v4l2_dbg_register)
+
+/* Experimental, meant for debugging, testing and internal use.
+   Never use this ioctl in applications!
+   Note: this ioctl is deprecated in favor of VIDIOC_DBG_G_CHIP_INFO and
+   will go away in the future. */
+#define VIDIOC_DBG_G_CHIP_IDENT _IOWR('V', 81, struct v4l2_dbg_chip_ident)
 
 #define VIDIOC_S_HW_FREQ_SEEK	 _IOW('V', 82, struct v4l2_hw_freq_seek)
 #define	VIDIOC_S_DV_TIMINGS	_IOWR('V', 87, struct v4l2_dv_timings)

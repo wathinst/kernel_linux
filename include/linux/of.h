@@ -236,8 +236,8 @@ extern struct device_node *of_find_all_nodes(struct device_node *prev);
 static inline u64 of_read_number(const __be32 *cell, int size)
 {
 	u64 r = 0;
-	for (; size--; cell++)
-		r = (r << 32) | be32_to_cpu(*cell);
+	while (size--)
+		r = (r << 32) | be32_to_cpu(*(cell++));
 	return r;
 }
 
@@ -397,6 +397,7 @@ extern int of_phandle_iterator_args(struct of_phandle_iterator *it,
 extern void of_alias_scan(void * (*dt_alloc)(u64 size, u64 align));
 extern int of_alias_get_id(struct device_node *np, const char *stem);
 extern int of_alias_get_highest_id(const char *stem);
+extern int of_alias_max_index(const char *stem);
 
 extern int of_machine_is_compatible(const char *compat);
 
@@ -898,6 +899,11 @@ static inline int of_alias_get_highest_id(const char *stem)
 	return -ENOSYS;
 }
 
+static inline int of_alias_max_index(const char *stem)
+{
+	return -ENODEV;
+}
+
 static inline int of_machine_is_compatible(const char *compat)
 {
 	return 0;
@@ -968,12 +974,6 @@ static inline int of_cpu_node_to_id(struct device_node *np)
 #define of_node_cmp(s1, s2)		strcasecmp((s1), (s2))
 #endif
 
-static inline int of_prop_val_eq(struct property *p1, struct property *p2)
-{
-	return p1->length == p2->length &&
-	       !memcmp(p1->value, p2->value, (size_t)p1->length);
-}
-
 #if defined(CONFIG_OF) && defined(CONFIG_NUMA)
 extern int of_node_to_nid(struct device_node *np);
 #else
@@ -1001,7 +1001,7 @@ static inline struct device_node *of_find_matching_node(
 
 static inline const char *of_node_get_device_type(const struct device_node *np)
 {
-	return of_get_property(np, "device_type", NULL);
+	return of_get_property(np, "type", NULL);
 }
 
 static inline bool of_node_is_type(const struct device_node *np, const char *type)
@@ -1425,8 +1425,7 @@ int of_overlay_notifier_unregister(struct notifier_block *nb);
 
 #else
 
-static inline int of_overlay_fdt_apply(void *overlay_fdt, u32 overlay_fdt_size,
-				       int *ovcs_id)
+static inline int of_overlay_fdt_apply(void *overlay_fdt, int *ovcs_id)
 {
 	return -ENOTSUPP;
 }

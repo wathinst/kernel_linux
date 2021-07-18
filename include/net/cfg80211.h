@@ -3050,9 +3050,6 @@ struct cfg80211_external_auth_params {
  *
  * @start_radar_detection: Start radar detection in the driver.
  *
- * @end_cac: End running CAC, probably because a related CAC
- *	was finished on another phy.
- *
  * @update_ft_ies: Provide updated Fast BSS Transition information to the
  *	driver. If the SME is in the driver/firmware, this information can be
  *	used in building Authentication and Reassociation Request frames.
@@ -3367,8 +3364,6 @@ struct cfg80211_ops {
 					 struct net_device *dev,
 					 struct cfg80211_chan_def *chandef,
 					 u32 cac_time_ms);
-	void	(*end_cac)(struct wiphy *wiphy,
-				struct net_device *dev);
 	int	(*update_ft_ies)(struct wiphy *wiphy, struct net_device *dev,
 				 struct cfg80211_update_ft_ies_params *ftie);
 	int	(*crit_proto_start)(struct wiphy *wiphy,
@@ -3453,8 +3448,7 @@ struct cfg80211_ops {
  *	on wiphy_new(), but can be changed by the driver if it has a good
  *	reason to override the default
  * @WIPHY_FLAG_4ADDR_AP: supports 4addr mode even on AP (with a single station
- *	on a VLAN interface). This flag also serves an extra purpose of
- *	supporting 4ADDR AP mode on devices which do not support AP/VLAN iftype.
+ *	on a VLAN interface)
  * @WIPHY_FLAG_4ADDR_STATION: supports 4addr mode even as a station
  * @WIPHY_FLAG_CONTROL_PORT_PROTOCOL: This device supports setting the
  *	control port protocol ethertype. The device also honours the
@@ -3510,6 +3504,7 @@ enum wiphy_flags {
 	WIPHY_FLAG_SUPPORTS_5_10_MHZ		= BIT(22),
 	WIPHY_FLAG_HAS_CHANNEL_SWITCH		= BIT(23),
 	WIPHY_FLAG_HAS_STATIC_WEP		= BIT(24),
+	WIPHY_FLAG_DFS_OFFLOAD                  = BIT(25)
 };
 
 /**
@@ -4739,17 +4734,6 @@ const u8 *cfg80211_find_vendor_ie(unsigned int oui, int oui_type,
 				  const u8 *ies, int len);
 
 /**
- * cfg80211_send_layer2_update - send layer 2 update frame
- *
- * @dev: network device
- * @addr: STA MAC address
- *
- * Wireless drivers can use this function to update forwarding tables in bridge
- * devices upon STA association.
- */
-void cfg80211_send_layer2_update(struct net_device *dev, const u8 *addr);
-
-/**
  * DOC: Regulatory enforcement infrastructure
  *
  * TODO
@@ -4781,6 +4765,32 @@ void cfg80211_send_layer2_update(struct net_device *dev, const u8 *addr);
  * Return: 0 on success. -ENOMEM.
  */
 int regulatory_hint(struct wiphy *wiphy, const char *alpha2);
+
+/**
+ * regulatory_hint_user - hint to the wireless core a regulatory domain
+ * which the driver has received from an application
+ * @alpha2: the ISO/IEC 3166 alpha2 the driver claims its regulatory domain
+ *  should be in. If @rd is set this should be NULL. Note that if you
+ *  set this to NULL you should still set rd->alpha2 to some accepted
+ *  alpha2.
+ * @user_reg_hint_type: the type of user regulatory hint.
+ *
+ * Wireless drivers can use this function to hint to the wireless core
+ * the current regulatory domain as specified by trusted applications,
+ * it is the driver's responsibilty to estbalish which applications it
+ * trusts.
+ *
+ * The wiphy should be registered to cfg80211 prior to this call.
+ * For cfg80211 drivers this means you must first use wiphy_register(),
+ * for mac80211 drivers you must first use ieee80211_register_hw().
+ *
+ * Drivers should check the return value, its possible you can get
+ * an -ENOMEM or an -EINVAL.
+ *
+ * Return: 0 on success. -ENOMEM, -EINVAL.
+ */
+int regulatory_hint_user(const char *alpha2,
+             enum nl80211_user_reg_hint_type user_reg_hint_type);
 
 /**
  * regulatory_set_wiphy_regd - set regdom info for self managed drivers
@@ -6579,19 +6589,14 @@ int cfg80211_external_auth_request(struct net_device *netdev,
 				   gfp_t gfp);
 
 /**
- * cfg80211_iftype_allowed - check whether the interface can be allowed
- * @wiphy: the wiphy
- * @iftype: interface type
- * @is_4addr: use_4addr flag, must be '0' when check_swif is '1'
- * @check_swif: check iftype against software interfaces
+ * cfg80211_is_gratuitous_arp_unsolicited_na - packet is grat. ARP/unsol. NA
+ * @skb: the input packet, must be an ethernet frame already
  *
- * Check whether the interface is allowed to operate; additionally, this API
- * can be used to check iftype against the software interfaces when
- * check_swif is '1'.
+ * Return: %true if the packet is a gratuitous ARP or unsolicited NA packet.
+ * This is used to drop packets that shouldn't occur because the AP implements
+ * a proxy service.
  */
-bool cfg80211_iftype_allowed(struct wiphy *wiphy, enum nl80211_iftype iftype,
-			     bool is_4addr, u8 check_swif);
-
+bool cfg80211_is_gratuitous_arp_unsolicited_na(struct sk_buff *skb);
 
 /* Logging, debugging and troubleshooting/diagnostic helpers. */
 

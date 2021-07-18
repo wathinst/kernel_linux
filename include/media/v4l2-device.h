@@ -66,6 +66,8 @@ struct v4l2_device {
 			unsigned int notification, void *arg);
 	struct v4l2_ctrl_handler *ctrl_handler;
 	struct v4l2_prio_state prio;
+	/* BKL replacement mutex. Temporary solution only. */
+	struct mutex ioctl_lock;
 	struct kref ref;
 	void (*release)(struct v4l2_device *v4l2_dev);
 };
@@ -372,7 +374,7 @@ static inline void v4l2_subdev_notify(struct v4l2_subdev *sd,
 		struct v4l2_subdev *__sd;				\
 									\
 		__v4l2_device_call_subdevs_p(v4l2_dev, __sd,		\
-			(grpid) == 0 || __sd->grp_id == (grpid), o, f ,	\
+			!(grpid) || __sd->grp_id == (grpid), o, f ,	\
 			##args);					\
 	} while (0)
 
@@ -404,7 +406,7 @@ static inline void v4l2_subdev_notify(struct v4l2_subdev *sd,
 ({									\
 	struct v4l2_subdev *__sd;					\
 	__v4l2_device_call_subdevs_until_err_p(v4l2_dev, __sd,		\
-			(grpid) == 0 || __sd->grp_id == (grpid), o, f ,	\
+			!(grpid) || __sd->grp_id == (grpid), o, f ,	\
 			##args);					\
 })
 
@@ -432,8 +434,8 @@ static inline void v4l2_subdev_notify(struct v4l2_subdev *sd,
 		struct v4l2_subdev *__sd;				\
 									\
 		__v4l2_device_call_subdevs_p(v4l2_dev, __sd,		\
-			(grpmsk) == 0 || (__sd->grp_id & (grpmsk)), o,	\
-			f , ##args);					\
+			!(grpmsk) || (__sd->grp_id & (grpmsk)), o, f ,	\
+			##args);					\
 	} while (0)
 
 /**
@@ -463,8 +465,8 @@ static inline void v4l2_subdev_notify(struct v4l2_subdev *sd,
 ({									\
 	struct v4l2_subdev *__sd;					\
 	__v4l2_device_call_subdevs_until_err_p(v4l2_dev, __sd,		\
-			(grpmsk) == 0 || (__sd->grp_id & (grpmsk)), o,	\
-			f , ##args);					\
+			!(grpmsk) || (__sd->grp_id & (grpmsk)), o, f ,	\
+			##args);					\
 })
 
 

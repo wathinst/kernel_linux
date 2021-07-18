@@ -345,6 +345,8 @@ enum dma_slave_buswidth {
  * loops in this area in order to transfer the data.
  * @dst_port_window_size: same as src_port_window_size but for the destination
  * port.
+ * @src_fifo_num: bit 0-7 is the fifo number, bit:8-11 is the fifo offset;
+ * @dst_fifo_num: same as src_fifo_num
  * @device_fc: Flow Controller Settings. Only valid for slave channels. Fill
  * with 'true' if peripheral should be flow controller. Direction will be
  * selected at Runtime.
@@ -374,6 +376,8 @@ struct dma_slave_config {
 	u32 dst_maxburst;
 	u32 src_port_window_size;
 	u32 dst_port_window_size;
+	u32 src_fifo_num;
+	u32 dst_fifo_num;
 	bool device_fc;
 	unsigned int slave_id;
 };
@@ -686,7 +690,6 @@ struct dma_filter {
  * @fill_align: alignment shift for memset operations
  * @dev_id: unique device ID
  * @dev: struct device reference for dma mapping api
- * @owner: owner module (automatically set based on the provided dev)
  * @src_addr_widths: bit mask of src addr widths the device supports
  *	Width is specified in bytes, e.g. for a device supporting
  *	a width of 4 the mask should have BIT(4) set.
@@ -750,7 +753,6 @@ struct dma_device {
 
 	int dev_id;
 	struct device *dev;
-	struct module *owner;
 
 	u32 src_addr_widths;
 	u32 dst_addr_widths;
@@ -1375,11 +1377,8 @@ static inline int dma_get_slave_caps(struct dma_chan *chan,
 static inline int dmaengine_desc_set_reuse(struct dma_async_tx_descriptor *tx)
 {
 	struct dma_slave_caps caps;
-	int ret;
 
-	ret = dma_get_slave_caps(tx->chan, &caps);
-	if (ret)
-		return ret;
+	dma_get_slave_caps(tx->chan, &caps);
 
 	if (caps.descriptor_reuse) {
 		tx->flags |= DMA_CTRL_REUSE;

@@ -721,11 +721,6 @@ static inline void __sk_nulls_add_node_rcu(struct sock *sk, struct hlist_nulls_h
 	hlist_nulls_add_head_rcu(&sk->sk_nulls_node, list);
 }
 
-static inline void __sk_nulls_add_node_tail_rcu(struct sock *sk, struct hlist_nulls_head *list)
-{
-	hlist_nulls_add_tail_rcu(&sk->sk_nulls_node, list);
-}
-
 static inline void sk_nulls_add_node_rcu(struct sock *sk, struct hlist_nulls_head *list)
 {
 	sock_hold(sk);
@@ -845,8 +840,6 @@ static inline int sk_memalloc_socks(void)
 {
 	return static_branch_unlikely(&memalloc_socks_key);
 }
-
-void __receive_sock(struct file *file);
 #else
 
 static inline int sk_memalloc_socks(void)
@@ -854,8 +847,6 @@ static inline int sk_memalloc_socks(void)
 	return 0;
 }
 
-static inline void __receive_sock(struct file *file)
-{ }
 #endif
 
 static inline gfp_t sk_gfp_mask(const struct sock *sk, gfp_t gfp_mask)
@@ -900,11 +891,11 @@ static inline void __sk_add_backlog(struct sock *sk, struct sk_buff *skb)
 	skb_dst_force(skb);
 
 	if (!sk->sk_backlog.tail)
-		WRITE_ONCE(sk->sk_backlog.head, skb);
+		sk->sk_backlog.head = skb;
 	else
 		sk->sk_backlog.tail->next = skb;
 
-	WRITE_ONCE(sk->sk_backlog.tail, skb);
+	sk->sk_backlog.tail = skb;
 	skb->next = NULL;
 }
 
@@ -954,8 +945,8 @@ static inline void sk_incoming_cpu_update(struct sock *sk)
 {
 	int cpu = raw_smp_processor_id();
 
-	if (unlikely(READ_ONCE(sk->sk_incoming_cpu) != cpu))
-		WRITE_ONCE(sk->sk_incoming_cpu, cpu);
+	if (unlikely(sk->sk_incoming_cpu != cpu))
+		sk->sk_incoming_cpu = cpu;
 }
 
 static inline void sock_rps_record_flow_hash(__u32 hash)
@@ -1281,7 +1272,7 @@ static inline void sk_sockets_allocated_inc(struct sock *sk)
 	percpu_counter_inc(sk->sk_prot->sockets_allocated);
 }
 
-static inline u64
+static inline int
 sk_sockets_allocated_read_positive(struct sock *sk)
 {
 	return percpu_counter_read_positive(sk->sk_prot->sockets_allocated);
@@ -1779,6 +1770,7 @@ static inline int sk_rx_queue_get(const struct sock *sk)
 
 static inline void sk_set_socket(struct sock *sk, struct socket *sock)
 {
+	sk_tx_queue_clear(sk);
 	sk->sk_socket = sock;
 }
 
@@ -2224,17 +2216,12 @@ struct sk_buff *sk_stream_alloc_skb(struct sock *sk, int size, gfp_t gfp,
  * sk_page_frag - return an appropriate page_frag
  * @sk: socket
  *
- * Use the per task page_frag instead of the per socket one for
- * optimization when we know that we're in the normal context and owns
- * everything that's associated with %current.
- *
- * gfpflags_allow_blocking() isn't enough here as direct reclaim may nest
- * inside other socket operations and end up recursing into sk_page_frag()
- * while it's already in use.
+ * If socket allocation mode allows current thread to sleep, it means its
+ * safe to use the per task page_frag instead of the per socket one.
  */
 static inline struct page_frag *sk_page_frag(struct sock *sk)
 {
-	if (gfpflags_normal_context(sk->sk_allocation))
+	if (gfpflags_allow_blocking(sk->sk_allocation))
 		return &current->task_frag;
 
 	return &sk->sk_frag;
@@ -2326,7 +2313,7 @@ static inline ktime_t sock_read_timestamp(struct sock *sk)
 
 	return kt;
 #else
-	return READ_ONCE(sk->sk_stamp);
+	return sk->sk_stamp;
 #endif
 }
 
@@ -2337,7 +2324,7 @@ static inline void sock_write_timestamp(struct sock *sk, ktime_t kt)
 	sk->sk_stamp = kt;
 	write_sequnlock(&sk->sk_stamp_seq);
 #else
-	WRITE_ONCE(sk->sk_stamp, kt);
+	sk->sk_stamp = kt;
 #endif
 }
 
