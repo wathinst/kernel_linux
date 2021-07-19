@@ -289,6 +289,7 @@ struct hdmi_codec_priv {
 
 static const struct snd_soc_dapm_widget hdmi_widgets[] = {
 	SND_SOC_DAPM_OUTPUT("TX"),
+	SND_SOC_DAPM_OUTPUT("RX"),
 };
 
 enum {
@@ -414,6 +415,7 @@ static int hdmi_codec_startup(struct snd_pcm_substream *substream,
 			      struct snd_soc_dai *dai)
 {
 	struct hdmi_codec_priv *hcp = snd_soc_dai_get_drvdata(dai);
+	bool tx = substream->stream == SNDRV_PCM_STREAM_PLAYBACK;
 	int ret = 0;
 
 	dev_dbg(dai->dev, "%s()\n", __func__);
@@ -432,19 +434,15 @@ static int hdmi_codec_startup(struct snd_pcm_substream *substream,
 		}
 	}
 
-	if (hcp->hcd.ops->get_eld) {
+	if (tx && hcp->hcd.ops->get_eld) {
 		ret = hcp->hcd.ops->get_eld(dai->dev->parent, hcp->hcd.data,
 					    hcp->eld, sizeof(hcp->eld));
 
 		if (!ret) {
 			ret = snd_pcm_hw_constraint_eld(substream->runtime,
 							hcp->eld);
-			if (ret) {
-				mutex_lock(&hcp->current_stream_lock);
-				hcp->current_stream = NULL;
-				mutex_unlock(&hcp->current_stream_lock);
+			if (ret)
 				return ret;
-			}
 		}
 		/* Select chmap supported */
 		hdmi_codec_eld_chmap(hcp);
@@ -512,13 +510,11 @@ static int hdmi_codec_hw_params(struct snd_pcm_substream *substream,
 	/* Select a channel allocation that matches with ELD and pcm channels */
 	idx = hdmi_codec_get_ch_alloc_table_idx(hcp, hp.cea.channels);
 	if (idx < 0) {
-		dev_err(dai->dev, "Not able to map channels to speakers (%d)\n",
-			idx);
 		hcp->chmap_idx = HDMI_CODEC_CHMAP_IDX_UNKNOWN;
-		return idx;
+	} else {
+		hp.cea.channel_allocation = hdmi_codec_channel_alloc[idx].ca_id;
+		hcp->chmap_idx = hdmi_codec_channel_alloc[idx].ca_id;
 	}
-	hp.cea.channel_allocation = hdmi_codec_channel_alloc[idx].ca_id;
-	hcp->chmap_idx = hdmi_codec_channel_alloc[idx].ca_id;
 
 	hp.sample_width = params_width(params);
 	hp.sample_rate = params_rate(params);
@@ -533,71 +529,73 @@ static int hdmi_codec_set_fmt(struct snd_soc_dai *dai,
 {
 	struct hdmi_codec_priv *hcp = snd_soc_dai_get_drvdata(dai);
 	struct hdmi_codec_daifmt cf = { 0 };
+	int ret = 0;
 
 	dev_dbg(dai->dev, "%s()\n", __func__);
 
-	if (dai->id == DAI_ID_SPDIF)
-		return 0;
+	if (dai->id == DAI_ID_SPDIF) {
+		cf.fmt = HDMI_SPDIF;
+	} else {
+		switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
+		case SND_SOC_DAIFMT_CBM_CFM:
+			cf.bit_clk_master = 1;
+			cf.frame_clk_master = 1;
+			break;
+		case SND_SOC_DAIFMT_CBS_CFM:
+			cf.frame_clk_master = 1;
+			break;
+		case SND_SOC_DAIFMT_CBM_CFS:
+			cf.bit_clk_master = 1;
+			break;
+		case SND_SOC_DAIFMT_CBS_CFS:
+			break;
+		default:
+			return -EINVAL;
+		}
 
-	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
-	case SND_SOC_DAIFMT_CBM_CFM:
-		cf.bit_clk_master = 1;
-		cf.frame_clk_master = 1;
-		break;
-	case SND_SOC_DAIFMT_CBS_CFM:
-		cf.frame_clk_master = 1;
-		break;
-	case SND_SOC_DAIFMT_CBM_CFS:
-		cf.bit_clk_master = 1;
-		break;
-	case SND_SOC_DAIFMT_CBS_CFS:
-		break;
-	default:
-		return -EINVAL;
-	}
+		switch (fmt & SND_SOC_DAIFMT_INV_MASK) {
+		case SND_SOC_DAIFMT_NB_NF:
+			break;
+		case SND_SOC_DAIFMT_NB_IF:
+			cf.frame_clk_inv = 1;
+			break;
+		case SND_SOC_DAIFMT_IB_NF:
+			cf.bit_clk_inv = 1;
+			break;
+		case SND_SOC_DAIFMT_IB_IF:
+			cf.frame_clk_inv = 1;
+			cf.bit_clk_inv = 1;
+			break;
+		}
 
-	switch (fmt & SND_SOC_DAIFMT_INV_MASK) {
-	case SND_SOC_DAIFMT_NB_NF:
-		break;
-	case SND_SOC_DAIFMT_NB_IF:
-		cf.frame_clk_inv = 1;
-		break;
-	case SND_SOC_DAIFMT_IB_NF:
-		cf.bit_clk_inv = 1;
-		break;
-	case SND_SOC_DAIFMT_IB_IF:
-		cf.frame_clk_inv = 1;
-		cf.bit_clk_inv = 1;
-		break;
-	}
-
-	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
-	case SND_SOC_DAIFMT_I2S:
-		cf.fmt = HDMI_I2S;
-		break;
-	case SND_SOC_DAIFMT_DSP_A:
-		cf.fmt = HDMI_DSP_A;
-		break;
-	case SND_SOC_DAIFMT_DSP_B:
-		cf.fmt = HDMI_DSP_B;
-		break;
-	case SND_SOC_DAIFMT_RIGHT_J:
-		cf.fmt = HDMI_RIGHT_J;
-		break;
-	case SND_SOC_DAIFMT_LEFT_J:
-		cf.fmt = HDMI_LEFT_J;
-		break;
-	case SND_SOC_DAIFMT_AC97:
-		cf.fmt = HDMI_AC97;
-		break;
-	default:
-		dev_err(dai->dev, "Invalid DAI interface format\n");
-		return -EINVAL;
+		switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
+		case SND_SOC_DAIFMT_I2S:
+			cf.fmt = HDMI_I2S;
+			break;
+		case SND_SOC_DAIFMT_DSP_A:
+			cf.fmt = HDMI_DSP_A;
+			break;
+		case SND_SOC_DAIFMT_DSP_B:
+			cf.fmt = HDMI_DSP_B;
+			break;
+		case SND_SOC_DAIFMT_RIGHT_J:
+			cf.fmt = HDMI_RIGHT_J;
+			break;
+		case SND_SOC_DAIFMT_LEFT_J:
+			cf.fmt = HDMI_LEFT_J;
+			break;
+		case SND_SOC_DAIFMT_AC97:
+			cf.fmt = HDMI_AC97;
+			break;
+		default:
+			dev_err(dai->dev, "Invalid DAI interface format\n");
+			return -EINVAL;
+		}
 	}
 
 	hcp->daifmt[dai->id] = cf;
 
-	return 0;
+	return ret;
 }
 
 static int hdmi_codec_digital_mute(struct snd_soc_dai *dai, int mute)
@@ -690,14 +688,20 @@ static int hdmi_codec_pcm_new(struct snd_soc_pcm_runtime *rtd,
 static int hdmi_dai_probe(struct snd_soc_dai *dai)
 {
 	struct snd_soc_dapm_context *dapm;
-	struct snd_soc_dapm_route route = {
-		.sink = "TX",
-		.source = dai->driver->playback.stream_name,
+	struct snd_soc_dapm_route route[] = {
+		{
+			.sink = "TX",
+			.source = dai->driver->playback.stream_name,
+		},
+		{
+			.sink = "Capture",
+			.source = "RX",
+		},
 	};
 
 	dapm = snd_soc_component_get_dapm(dai->component);
 
-	return snd_soc_dapm_add_routes(dapm, &route, 1);
+	return snd_soc_dapm_add_routes(dapm, route, ARRAY_SIZE(route));
 }
 
 static const struct snd_soc_dai_driver hdmi_i2s_dai = {
@@ -706,6 +710,14 @@ static const struct snd_soc_dai_driver hdmi_i2s_dai = {
 	.probe = hdmi_dai_probe,
 	.playback = {
 		.stream_name = "I2S Playback",
+		.channels_min = 2,
+		.channels_max = 8,
+		.rates = HDMI_RATES,
+		.formats = I2S_FORMATS,
+		.sig_bits = 24,
+	},
+	.capture = {
+		.stream_name = "Capture",
 		.channels_min = 2,
 		.channels_max = 8,
 		.rates = HDMI_RATES,
@@ -722,6 +734,13 @@ static const struct snd_soc_dai_driver hdmi_spdif_dai = {
 	.probe = hdmi_dai_probe,
 	.playback = {
 		.stream_name = "SPDIF Playback",
+		.channels_min = 2,
+		.channels_max = 2,
+		.rates = HDMI_RATES,
+		.formats = SPDIF_FORMATS,
+	},
+	.capture = {
+		.stream_name = "Capture",
 		.channels_min = 2,
 		.channels_max = 2,
 		.rates = HDMI_RATES,
@@ -794,10 +813,8 @@ static int hdmi_codec_probe(struct platform_device *pdev)
 		i++;
 	}
 
-	if (hcd->spdif) {
+	if (hcd->spdif)
 		hcp->daidrv[i] = hdmi_spdif_dai;
-		hcp->daifmt[DAI_ID_SPDIF].fmt = HDMI_SPDIF;
-	}
 
 	dev_set_drvdata(dev, hcp);
 

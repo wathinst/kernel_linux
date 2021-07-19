@@ -414,7 +414,6 @@ static int sprd_eic_irq_set_type(struct irq_data *data, unsigned int flow_type)
 			irq_set_handler_locked(data, handle_edge_irq);
 			break;
 		case IRQ_TYPE_EDGE_BOTH:
-			sprd_eic_update(chip, offset, SPRD_EIC_SYNC_INTMODE, 0);
 			sprd_eic_update(chip, offset, SPRD_EIC_SYNC_INTBOTH, 1);
 			irq_set_handler_locked(data, handle_edge_irq);
 			break;
@@ -529,12 +528,11 @@ static void sprd_eic_handle_one_type(struct gpio_chip *chip)
 		}
 
 		for_each_set_bit(n, &reg, SPRD_EIC_PER_BANK_NR) {
-			u32 offset = bank * SPRD_EIC_PER_BANK_NR + n;
-
-			girq = irq_find_mapping(chip->irq.domain, offset);
+			girq = irq_find_mapping(chip->irq.domain,
+					bank * SPRD_EIC_PER_BANK_NR + n);
 
 			generic_handle_irq(girq);
-			sprd_eic_toggle_trigger(chip, girq, offset);
+			sprd_eic_toggle_trigger(chip, girq, n);
 		}
 	}
 }

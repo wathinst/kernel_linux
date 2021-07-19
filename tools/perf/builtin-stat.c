@@ -422,7 +422,7 @@ static void process_interval(void)
 	}
 
 	init_stats(&walltime_nsecs_stats);
-	update_stats(&walltime_nsecs_stats, stat_config.interval * 1000000ULL);
+	update_stats(&walltime_nsecs_stats, stat_config.interval * 1000000);
 	print_counters(&rs, 0, NULL);
 }
 
@@ -2497,8 +2497,8 @@ static int add_default_attributes(void)
 				fprintf(stderr,
 					"Cannot set up top down events %s: %d\n",
 					str, err);
-				parse_events_print_error(&errinfo, str);
 				free(str);
+				parse_events_print_error(&errinfo, str);
 				return -1;
 			}
 		} else {
@@ -3090,11 +3090,8 @@ int cmd_stat(int argc, const char **argv)
 			fprintf(output, "[ perf stat: executing run #%d ... ]\n",
 				run_idx + 1);
 
-		if (run_idx != 0)
-			perf_evlist__reset_prev_raw_counts(evsel_list);
-
 		status = run_perf_stat(argc, argv, run_idx);
-		if (forever && status != -1 && !interval) {
+		if (forever && status != -1) {
 			print_counters(NULL, argc, argv);
 			perf_stat__reset_stats();
 		}

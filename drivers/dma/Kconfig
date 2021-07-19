@@ -143,7 +143,7 @@ config DMA_JZ4740
 
 config DMA_JZ4780
 	tristate "JZ4780 DMA support"
-	depends on MIPS || COMPILE_TEST
+	depends on MACH_JZ4780 || COMPILE_TEST
 	select DMA_ENGINE
 	select DMA_VIRTUAL_CHANNELS
 	help
@@ -217,6 +217,18 @@ config FSL_EDMA
 	  Support the Freescale eDMA engine with programmable channel
 	  multiplexing capability for DMA request sources(slot).
 	  This module can be found on Freescale Vybrid and LS-1 SoCs.
+
+config FSL_EDMA_V3
+	tristate "Freescale eDMA v3 engine support"
+	depends on OF
+	select DMA_ENGINE
+	select DMA_VIRTUAL_CHANNELS
+	help
+	  Support the Freescale eDMA v3 engine with programmable channel.
+	  This driver is based on FSL_EDMA but big changes come such as
+	  different interrupt for different channel, different register
+	  scope for different channel.
+	  This module can be found on Freescale i.MX8QM.
 
 config FSL_RAID
         tristate "Freescale RAID engine Support"
@@ -387,6 +399,8 @@ config MXS_DMA
 	help
 	  Support the MXS DMA engine. This engine including APBH-DMA
 	  and APBX-DMA is integrated into some Freescale chips.
+
+source "drivers/dma/pxp/Kconfig"
 
 config MX3_IPU
 	bool "MX3x Image Processing Unit support"

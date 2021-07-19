@@ -720,8 +720,9 @@ try_again:
 			/* Retry init sequence, but without R4_18V_PRESENT. */
 			retries = 0;
 			goto try_again;
+		} else {
+			goto remove;
 		}
-		return err;
 	}
 
 	/*
@@ -828,6 +829,37 @@ static int mmc_sdio_reinit_card(struct mmc_host *host, bool powered_resume)
 				  powered_resume);
 }
 
+int sdio_reset_comm(struct mmc_card *card)
+{
+	struct mmc_host *host = card->host;
+	u32 ocr;
+	u32 rocr;
+	int err;
+
+	mmc_claim_host(host);
+	mmc_go_idle(host);
+	mmc_set_clock(host, host->f_min);
+	err = mmc_send_io_op_cond(host, 0, &ocr);
+	if (err)
+		goto err;
+	rocr = mmc_select_voltage(host, ocr);
+	if (!rocr) {
+		err = -EINVAL;
+		goto err;
+	}
+	err = mmc_sdio_init_card(host, rocr, card, 0);
+	if (err)
+		goto err;
+	mmc_release_host(host);
+	return 0;
+err:
+	pr_err("%s: Error resetting SDIO communications (%d)\n",
+		mmc_hostname(host), err);
+	mmc_release_host(host);
+	return err;
+}
+EXPORT_SYMBOL(sdio_reset_comm);
+
 /*
  * Host is being removed. Free up the current card.
  */
@@ -843,8 +875,21 @@ static void mmc_sdio_remove(struct mmc_host *host)
 	}
 
 	mmc_remove_card(host->card);
+	/* clear rescan_entered in case force remove */
+	host->rescan_entered = 0;
 	host->card = NULL;
 }
+
+void mmc_sdio_force_remove(struct mmc_host *host)
+{
+	mmc_sdio_remove(host);
+
+	mmc_claim_host(host);
+	mmc_detach_bus(host);
+	mmc_power_off(host);
+	mmc_release_host(host);
+}
+EXPORT_SYMBOL_GPL(mmc_sdio_force_remove);
 
 /*
  * Card detection - card is alive.
@@ -933,10 +978,6 @@ static int mmc_sdio_pre_suspend(struct mmc_host *host)
  */
 static int mmc_sdio_suspend(struct mmc_host *host)
 {
-	/* Prevent processing of SDIO IRQs in suspended state. */
-	mmc_card_set_suspended(host->card);
-	cancel_delayed_work_sync(&host->sdio_irq_work);
-
 	mmc_claim_host(host);
 
 	if (mmc_card_keep_power(host) && mmc_card_wake_sdio_irq(host))
@@ -985,20 +1026,13 @@ static int mmc_sdio_resume(struct mmc_host *host)
 		err = sdio_enable_4bit_bus(host->card);
 	}
 
-	if (err)
-		goto out;
-
-	/* Allow SDIO IRQs to be processed again. */
-	mmc_card_clr_suspended(host->card);
-
-	if (host->sdio_irqs) {
+	if (!err && host->sdio_irqs) {
 		if (!(host->caps2 & MMC_CAP2_SDIO_IRQ_NOTHREAD))
 			wake_up_process(host->sdio_irq_thread);
 		else if (host->caps & MMC_CAP_SDIO_IRQ)
 			host->ops->enable_sdio_irq(host, 1);
 	}
 
-out:
 	mmc_release_host(host);
 
 	host->pm_flags &= ~MMC_PM_KEEP_POWER;

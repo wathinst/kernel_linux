@@ -2357,7 +2357,6 @@ static int srp_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *scmnd)
 
 	if (srp_post_send(ch, iu, len)) {
 		shost_printk(KERN_ERR, target->scsi_host, PFX "Send failed\n");
-		scmnd->result = DID_ERROR << 16;
 		goto err_unmap;
 	}
 
@@ -3402,17 +3401,13 @@ static const match_table_t srp_opt_tokens = {
 
 /**
  * srp_parse_in - parse an IP address and port number combination
- * @net:	   [in]  Network namespace.
- * @sa:		   [out] Address family, IP address and port number.
- * @addr_port_str: [in]  IP address and port number.
- * @has_port:	   [out] Whether or not @addr_port_str includes a port number.
  *
  * Parse the following address formats:
  * - IPv4: <ip_address>:<port>, e.g. 1.2.3.4:5.
  * - IPv6: \[<ipv6_address>\]:<port>, e.g. [1::2:3%4]:5.
  */
 static int srp_parse_in(struct net *net, struct sockaddr_storage *sa,
-			const char *addr_port_str, bool *has_port)
+			const char *addr_port_str)
 {
 	char *addr_end, *addr = kstrdup(addr_port_str, GFP_KERNEL);
 	char *port_str;
@@ -3421,12 +3416,9 @@ static int srp_parse_in(struct net *net, struct sockaddr_storage *sa,
 	if (!addr)
 		return -ENOMEM;
 	port_str = strrchr(addr, ':');
-	if (port_str && strchr(port_str, ']'))
-		port_str = NULL;
-	if (port_str)
-		*port_str++ = '\0';
-	if (has_port)
-		*has_port = port_str != NULL;
+	if (!port_str)
+		return -EINVAL;
+	*port_str++ = '\0';
 	ret = inet_pton_with_scope(net, AF_INET, addr, port_str, sa);
 	if (ret && addr[0]) {
 		addr_end = addr + strlen(addr) - 1;
@@ -3448,7 +3440,6 @@ static int srp_parse_options(struct net *net, const char *buf,
 	char *p;
 	substring_t args[MAX_OPT_ARGS];
 	unsigned long long ull;
-	bool has_port;
 	int opt_mask = 0;
 	int token;
 	int ret = -EINVAL;
@@ -3547,8 +3538,7 @@ static int srp_parse_options(struct net *net, const char *buf,
 				ret = -ENOMEM;
 				goto out;
 			}
-			ret = srp_parse_in(net, &target->rdma_cm.src.ss, p,
-					   NULL);
+			ret = srp_parse_in(net, &target->rdma_cm.src.ss, p);
 			if (ret < 0) {
 				pr_warn("bad source parameter '%s'\n", p);
 				kfree(p);
@@ -3564,10 +3554,7 @@ static int srp_parse_options(struct net *net, const char *buf,
 				ret = -ENOMEM;
 				goto out;
 			}
-			ret = srp_parse_in(net, &target->rdma_cm.dst.ss, p,
-					   &has_port);
-			if (!has_port)
-				ret = -EINVAL;
+			ret = srp_parse_in(net, &target->rdma_cm.dst.ss, p);
 			if (ret < 0) {
 				pr_warn("bad dest parameter '%s'\n", p);
 				kfree(p);

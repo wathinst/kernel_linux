@@ -131,7 +131,6 @@ config I2C_I801
 	    Cannon Lake (PCH)
 	    Cedar Fork (PCH)
 	    Ice Lake (PCH)
-	    Comet Lake (PCH)
 
 	  This driver can also be built as a module.  If so, the module
 	  will be called i2c-i801.
@@ -433,13 +432,12 @@ config I2C_BCM_KONA
 	  If you do not need KONA I2C interface, say N.
 
 config I2C_BRCMSTB
-	tristate "BRCM Settop/DSL I2C controller"
-	depends on ARCH_BRCMSTB || BMIPS_GENERIC || ARCH_BCM_63XX || \
-		   COMPILE_TEST
+	tristate "BRCM Settop I2C controller"
+	depends on ARCH_BRCMSTB || BMIPS_GENERIC || COMPILE_TEST
 	default y
 	help
 	  If you say yes to this option, support will be included for the
-	  I2C interface on the Broadcom Settop/DSL SoCs.
+	  I2C interface on the Broadcom Settop SoCs.
 
 	  If you do not need I2C interface, say N.
 
@@ -877,6 +875,12 @@ config I2C_RK3X
 	  This driver can also be built as a module. If so, the module will
 	  be called i2c-rk3x.
 
+config I2C_RPBUS
+	tristate "I2C proxy bus over RPMSG"
+	depends on I2C && RPMSG
+	help
+	  This driver can support virtual i2c-rpmsg function.
+
 config HAVE_S3C2410_I2C
 	bool
 	help
@@ -1117,7 +1121,6 @@ config I2C_RCAR
 	tristate "Renesas R-Car I2C Controller"
 	depends on ARCH_RENESAS || COMPILE_TEST
 	select I2C_SLAVE
-	select RESET_CONTROLLER if ARCH_RCAR_GEN3
 	help
 	  If you say yes to this option, support will be included for the
 	  R-Car I2C controller.
@@ -1360,5 +1363,25 @@ config I2C_FSI
 
 	  This driver can also be built as a module. If so, the module will be
 	  called as i2c-fsi.
+
+config XEN_I2C_FRONTEND
+	tristate "Xen virtual i2c device support"
+	depends on XEN
+	default y
+	select XEN_XENBUS_FRONTEND
+	help
+	  This driver implements the front-end of the Xen virtual
+	  i2c device driver.  It communicates with a back-end driver
+	  in another domain which drives the actual i2c device.
+
+config XEN_I2C_BACKEND
+	tristate "Xen i2c-device backend driver"
+	depends on XEN_BACKEND
+	help
+	  The i2c-device backend driver allows the kernel to export its
+	  block devices to other guests.
+
+	  The corresponding Linux frontend driver is enabled by the
+	  CONFIG_XEN_I2C_FRONTEND configuration option.
 
 endmenu

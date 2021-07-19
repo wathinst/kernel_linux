@@ -1164,7 +1164,7 @@ static int set_machine_constraints(struct regulator_dev *rdev,
 		}
 	}
 
-	if ((rdev->constraints->ramp_delay || rdev->constraints->ramp_disable)
+	if ((rdev->constraints->ramp_delay && !rdev->constraints->ramp_disable)
 		&& ops->set_ramp_delay) {
 		ret = ops->set_ramp_delay(rdev, rdev->constraints->ramp_delay);
 		if (ret < 0) {
@@ -1257,7 +1257,7 @@ static int set_consumer_device_supply(struct regulator_dev *rdev,
 				      const char *consumer_dev_name,
 				      const char *supply)
 {
-	struct regulator_map *node, *new_node;
+	struct regulator_map *node;
 	int has_dev;
 
 	if (supply == NULL)
@@ -1268,22 +1268,6 @@ static int set_consumer_device_supply(struct regulator_dev *rdev,
 	else
 		has_dev = 0;
 
-	new_node = kzalloc(sizeof(struct regulator_map), GFP_KERNEL);
-	if (new_node == NULL)
-		return -ENOMEM;
-
-	new_node->regulator = rdev;
-	new_node->supply = supply;
-
-	if (has_dev) {
-		new_node->dev_name = kstrdup(consumer_dev_name, GFP_KERNEL);
-		if (new_node->dev_name == NULL) {
-			kfree(new_node);
-			return -ENOMEM;
-		}
-	}
-
-	mutex_lock(&regulator_list_mutex);
 	list_for_each_entry(node, &regulator_map_list, list) {
 		if (node->dev_name && consumer_dev_name) {
 			if (strcmp(node->dev_name, consumer_dev_name) != 0)
@@ -1301,19 +1285,26 @@ static int set_consumer_device_supply(struct regulator_dev *rdev,
 			 node->regulator->desc->name,
 			 supply,
 			 dev_name(&rdev->dev), rdev_get_name(rdev));
-		goto fail;
+		return -EBUSY;
 	}
 
-	list_add(&new_node->list, &regulator_map_list);
-	mutex_unlock(&regulator_list_mutex);
+	node = kzalloc(sizeof(struct regulator_map), GFP_KERNEL);
+	if (node == NULL)
+		return -ENOMEM;
 
+	node->regulator = rdev;
+	node->supply = supply;
+
+	if (has_dev) {
+		node->dev_name = kstrdup(consumer_dev_name, GFP_KERNEL);
+		if (node->dev_name == NULL) {
+			kfree(node);
+			return -ENOMEM;
+		}
+	}
+
+	list_add(&node->list, &regulator_map_list);
 	return 0;
-
-fail:
-	mutex_unlock(&regulator_list_mutex);
-	kfree(new_node->dev_name);
-	kfree(new_node);
-	return -EBUSY;
 }
 
 static void unset_regulator_supplies(struct regulator_dev *rdev)
@@ -1733,8 +1724,8 @@ struct regulator *_regulator_get(struct device *dev, const char *id,
 	regulator = create_regulator(rdev, dev, id);
 	if (regulator == NULL) {
 		regulator = ERR_PTR(-ENOMEM);
-		module_put(rdev->owner);
 		put_device(&rdev->dev);
+		module_put(rdev->owner);
 		return regulator;
 	}
 
@@ -1860,13 +1851,13 @@ static void _regulator_put(struct regulator *regulator)
 
 	rdev->open_count--;
 	rdev->exclusive = 0;
+	put_device(&rdev->dev);
 	regulator_unlock(rdev);
 
 	kfree_const(regulator->supply_name);
 	kfree(regulator);
 
 	module_put(rdev->owner);
-	put_device(&rdev->dev);
 }
 
 /**
@@ -2166,6 +2157,7 @@ static int _regulator_do_enable(struct regulator_dev *rdev)
 {
 	int ret, delay;
 
+	_notifier_call_chain(rdev, REGULATOR_EVENT_PRE_DO_ENABLE, NULL);
 	/* Query before enabling in case configuration dependent.  */
 	ret = _regulator_get_enable_time(rdev);
 	if (ret >= 0) {
@@ -2225,6 +2217,7 @@ static int _regulator_do_enable(struct regulator_dev *rdev)
 	_regulator_enable_delay(delay);
 
 	trace_regulator_enable_complete(rdev_get_name(rdev));
+	_notifier_call_chain(rdev, REGULATOR_EVENT_AFT_DO_ENABLE, NULL);
 
 	return 0;
 }
@@ -2306,6 +2299,7 @@ static int _regulator_do_disable(struct regulator_dev *rdev)
 {
 	int ret;
 
+	_notifier_call_chain(rdev, REGULATOR_EVENT_PRE_DO_DISABLE, NULL);
 	trace_regulator_disable(rdev_get_name(rdev));
 
 	if (rdev->ena_pin) {
@@ -2792,6 +2786,11 @@ static int regulator_map_voltage(struct regulator_dev *rdev, int min_uV,
 	if (desc->ops->list_voltage == regulator_list_voltage_linear_range)
 		return regulator_map_voltage_linear_range(rdev, min_uV, max_uV);
 
+	if (desc->ops->list_voltage ==
+		regulator_list_voltage_pickable_linear_range)
+		return regulator_map_voltage_pickable_linear_range(rdev,
+							min_uV, max_uV);
+
 	return regulator_map_voltage_iterate(rdev, min_uV, max_uV);
 }
 
@@ -3003,6 +3002,35 @@ static int _regulator_do_set_suspend_voltage(struct regulator_dev *rdev,
 	return 0;
 }
 
+static bool _regulator_is_bypass(struct regulator_dev *rdev)
+{
+	bool bypassed = false;
+
+	if (rdev->desc->ops->get_bypass)
+		rdev->desc->ops->get_bypass(rdev, &bypassed);
+
+	return bypassed;
+}
+
+static inline bool _regulator_should_adjust_supply(struct regulator_dev *rdev)
+{
+	/* Check for adjustable supply */
+	if (!rdev->supply)
+		return false;
+	if (!regulator_ops_is_valid(rdev->supply->rdev, REGULATOR_CHANGE_VOLTAGE))
+		return false;
+
+	/* Check for need to adjust supply */
+	if (rdev->desc->min_dropout_uV)
+		return true;
+	if (_regulator_is_bypass(rdev))
+		return true;
+	if (!(rdev->desc->ops->get_voltage || rdev->desc->ops->get_voltage_sel))
+		return true;
+
+	return false;
+}
+
 static int regulator_set_voltage_unlocked(struct regulator *regulator,
 					  int min_uV, int max_uV,
 					  suspend_state_t state)
@@ -3057,11 +3085,7 @@ static int regulator_set_voltage_unlocked(struct regulator *regulator,
 	if (ret < 0)
 		goto out2;
 
-	if (rdev->supply &&
-	    regulator_ops_is_valid(rdev->supply->rdev,
-				   REGULATOR_CHANGE_VOLTAGE) &&
-	    (rdev->desc->min_dropout_uV || !(rdev->desc->ops->get_voltage ||
-					   rdev->desc->ops->get_voltage_sel))) {
+	if (_regulator_should_adjust_supply(rdev)) {
 		int current_supply_uV;
 		int selector;
 
@@ -4363,20 +4387,15 @@ regulator_register(const struct regulator_desc *regulator_desc,
 	else if (regulator_desc->supply_name)
 		rdev->supply_name = regulator_desc->supply_name;
 
+	/*
+	 * Attempt to resolve the regulator supply, if specified,
+	 * but don't return an error if we fail because we will try
+	 * to resolve it again later as more regulators are added.
+	 */
+	if (regulator_resolve_supply(rdev))
+		rdev_dbg(rdev, "unable to resolve supply\n");
+
 	ret = set_machine_constraints(rdev, constraints);
-	if (ret == -EPROBE_DEFER) {
-		/* Regulator might be in bypass mode and so needs its supply
-		 * to set the constraints */
-		/* FIXME: this currently triggers a chicken-and-egg problem
-		 * when creating -SUPPLY symlink in sysfs to a regulator
-		 * that is just being created */
-		ret = regulator_resolve_supply(rdev);
-		if (!ret)
-			ret = set_machine_constraints(rdev, constraints);
-		else
-			rdev_dbg(rdev, "unable to resolve supply early: %pe\n",
-				 ERR_PTR(ret));
-	}
 	if (ret < 0)
 		goto wash;
 
@@ -4389,16 +4408,19 @@ regulator_register(const struct regulator_desc *regulator_desc,
 
 	/* add consumers devices */
 	if (init_data) {
+		mutex_lock(&regulator_list_mutex);
 		for (i = 0; i < init_data->num_consumer_supplies; i++) {
 			ret = set_consumer_device_supply(rdev,
 				init_data->consumer_supplies[i].dev_name,
 				init_data->consumer_supplies[i].supply);
 			if (ret < 0) {
+				mutex_unlock(&regulator_list_mutex);
 				dev_err(dev, "Failed to set supply %s\n",
 					init_data->consumer_supplies[i].supply);
 				goto unset_supplies;
 			}
 		}
+		mutex_unlock(&regulator_list_mutex);
 	}
 
 	if (!rdev->desc->ops->get_voltage &&
@@ -4800,7 +4822,7 @@ static int __init regulator_init(void)
 /* init early to allow our consumers to complete system booting */
 core_initcall(regulator_init);
 
-static int regulator_late_cleanup(struct device *dev, void *data)
+static int __init regulator_late_cleanup(struct device *dev, void *data)
 {
 	struct regulator_dev *rdev = dev_to_rdev(dev);
 	const struct regulator_ops *ops = rdev->desc->ops;
@@ -4849,8 +4871,17 @@ unlock:
 	return 0;
 }
 
-static void regulator_init_complete_work_function(struct work_struct *work)
+static int __init regulator_init_complete(void)
 {
+	/*
+	 * Since DT doesn't provide an idiomatic mechanism for
+	 * enabling full constraints and since it's much more natural
+	 * with DT to provide them just assume that a DT enabled
+	 * system has full constraints.
+	 */
+	if (of_have_populated_dt())
+		has_full_constraints = true;
+
 	/*
 	 * Regulators may had failed to resolve their input supplies
 	 * when were registered, either because the input supply was
@@ -4868,35 +4899,6 @@ static void regulator_init_complete_work_function(struct work_struct *work)
 	 */
 	class_for_each_device(&regulator_class, NULL, NULL,
 			      regulator_late_cleanup);
-}
-
-static DECLARE_DELAYED_WORK(regulator_init_complete_work,
-			    regulator_init_complete_work_function);
-
-static int __init regulator_init_complete(void)
-{
-	/*
-	 * Since DT doesn't provide an idiomatic mechanism for
-	 * enabling full constraints and since it's much more natural
-	 * with DT to provide them just assume that a DT enabled
-	 * system has full constraints.
-	 */
-	if (of_have_populated_dt())
-		has_full_constraints = true;
-
-	/*
-	 * We punt completion for an arbitrary amount of time since
-	 * systems like distros will load many drivers from userspace
-	 * so consumers might not always be ready yet, this is
-	 * particularly an issue with laptops where this might bounce
-	 * the display off then on.  Ideally we'd get a notification
-	 * from userspace when this happens but we don't so just wait
-	 * a bit and hope we waited long enough.  It'd be better if
-	 * we'd only do this on systems that need it, and a kernel
-	 * command line option might be useful.
-	 */
-	schedule_delayed_work(&regulator_init_complete_work,
-			      msecs_to_jiffies(30000));
 
 	class_for_each_device(&regulator_class, NULL, NULL,
 			      regulator_register_fill_coupling_array);

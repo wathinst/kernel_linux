@@ -1895,6 +1895,36 @@ static void of_alias_add(struct alias_prop *ap, struct device_node *np,
 		 ap->alias, ap->stem, ap->id, np);
 }
 
+/*
+ * of_alias_max_index() - get the maximum index for a given alias stem
+ * @stem:   The alias stem for which the maximum index is searched for
+ *
+ * Given an alias stem (the alias without the number) this function
+ * returns the maximum number for which an alias exists.
+ *
+ * Return: The maximum existing alias index or -ENODEV if no alias
+ *         exists for this stem.
+ */
+int of_alias_max_index(const char *stem)
+{
+	struct alias_prop *app;
+	int max = -ENODEV;
+
+	mutex_lock(&of_mutex);
+
+	list_for_each_entry(app, &aliases_lookup, link) {
+		if (strcmp(app->stem, stem))
+			continue;
+		if (app->id > max)
+			max = app->id;
+	}
+
+	mutex_unlock(&of_mutex);
+
+	return max;
+}
+EXPORT_SYMBOL_GPL(of_alias_max_index);
+
 /**
  * of_alias_scan - Scan all properties of the 'aliases' node
  *
@@ -2066,7 +2096,7 @@ struct device_node *of_find_next_cache_node(const struct device_node *np)
 	/* OF on pmac has nodes instead of properties named "l2-cache"
 	 * beneath CPU nodes.
 	 */
-	if (IS_ENABLED(CONFIG_PPC_PMAC) && !strcmp(np->type, "cpu"))
+	if (!strcmp(np->type, "cpu"))
 		for_each_child_of_node(np, child)
 			if (!strcmp(child->type, "cache"))
 				return child;

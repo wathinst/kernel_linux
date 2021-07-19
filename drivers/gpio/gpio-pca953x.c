@@ -21,6 +21,7 @@
 #include <linux/of_platform.h>
 #include <linux/platform_data/pca953x.h>
 #include <linux/regulator/consumer.h>
+#include <linux/reset.h>
 #include <linux/slab.h>
 
 #include <asm/unaligned.h>
@@ -58,7 +59,7 @@
 #define PCA_GPIO_MASK		0x00FF
 
 #define PCAL_GPIO_MASK		0x1f
-#define PCAL_PINCTRL_MASK	0x60
+#define PCAL_PINCTRL_MASK	0xe0
 
 #define PCA_INT			0x0100
 #define PCA_PCAL		0x0200
@@ -873,6 +874,10 @@ static int pca953x_probe(struct i2c_client *client,
 	 */
 	lockdep_set_subclass(&chip->i2c_lock,
 			     i2c_adapter_depth(client->adapter));
+
+	ret = device_reset(&client->dev);
+	if (ret == -EPROBE_DEFER)
+		return -EPROBE_DEFER;
 
 	/* initialize cached registers from their original values.
 	 * we can't share this chip with another i2c master.

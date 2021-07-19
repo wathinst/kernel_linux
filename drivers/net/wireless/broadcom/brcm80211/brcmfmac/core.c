@@ -438,7 +438,7 @@ static int brcmf_rx_hdrpull(struct brcmf_pub *drvr, struct sk_buff *skb,
 	ret = brcmf_proto_hdrpull(drvr, true, skb, ifp);
 
 	if (ret || !(*ifp) || !(*ifp)->ndev) {
-		if (ret != -ENODATA && *ifp && (*ifp)->ndev)
+		if (ret != -ENODATA && *ifp)
 			(*ifp)->ndev->stats.rx_errors++;
 		brcmu_pkt_buf_free_skb(skb);
 		return -ENODATA;
@@ -464,8 +464,7 @@ void brcmf_rx_frame(struct device *dev, struct sk_buff *skb, bool handle_event)
 	} else {
 		/* Process special event packets */
 		if (handle_event)
-			brcmf_fweh_process_skb(ifp->drvr, skb,
-					       BCMILCP_SUBTYPE_VENDOR_LONG);
+			brcmf_fweh_process_skb(ifp->drvr, skb);
 
 		brcmf_netif_rx(ifp, skb);
 	}
@@ -482,7 +481,7 @@ void brcmf_rx_event(struct device *dev, struct sk_buff *skb)
 	if (brcmf_rx_hdrpull(drvr, skb, &ifp))
 		return;
 
-	brcmf_fweh_process_skb(ifp->drvr, skb, 0);
+	brcmf_fweh_process_skb(ifp->drvr, skb);
 	brcmu_pkt_buf_free_skb(skb);
 }
 
@@ -490,6 +489,11 @@ void brcmf_txfinalize(struct brcmf_if *ifp, struct sk_buff *txp, bool success)
 {
 	struct ethhdr *eh;
 	u16 type;
+
+	if (!ifp) {
+		brcmu_pkt_buf_free_skb(txp);
+		return;
+	}
 
 	eh = (struct ethhdr *)(txp->data);
 	type = ntohs(eh->h_proto);
@@ -533,8 +537,6 @@ static int brcmf_netdev_stop(struct net_device *ndev)
 	brcmf_dbg(TRACE, "Enter, bsscfgidx=%d\n", ifp->bsscfgidx);
 
 	brcmf_cfg80211_down(ndev);
-
-	brcmf_fil_iovar_data_set(ifp, "arp_hostip_clear", NULL, 0);
 
 	brcmf_net_setcarrier(ifp, false);
 
@@ -784,17 +786,17 @@ static void brcmf_del_if(struct brcmf_pub *drvr, s32 bsscfgidx,
 			 bool rtnl_locked)
 {
 	struct brcmf_if *ifp;
-	int ifidx;
 
 	ifp = drvr->iflist[bsscfgidx];
+	drvr->iflist[bsscfgidx] = NULL;
 	if (!ifp) {
 		brcmf_err("Null interface, bsscfgidx=%d\n", bsscfgidx);
 		return;
 	}
 	brcmf_dbg(TRACE, "Enter, bsscfgidx=%d, ifidx=%d\n", bsscfgidx,
 		  ifp->ifidx);
-	ifidx = ifp->ifidx;
-
+	if (drvr->if2bss[ifp->ifidx] == bsscfgidx)
+		drvr->if2bss[ifp->ifidx] = BRCMF_BSSIDX_INVALID;
 	if (ifp->ndev) {
 		if (bsscfgidx == 0) {
 			if (ifp->ndev->netdev_ops == &brcmf_netdev_ops_pri) {
@@ -822,10 +824,6 @@ static void brcmf_del_if(struct brcmf_pub *drvr, s32 bsscfgidx,
 		brcmf_p2p_ifp_removed(ifp, rtnl_locked);
 		kfree(ifp);
 	}
-
-	drvr->iflist[bsscfgidx] = NULL;
-	if (drvr->if2bss[ifidx] == bsscfgidx)
-		drvr->if2bss[ifidx] = BRCMF_BSSIDX_INVALID;
 }
 
 void brcmf_remove_interface(struct brcmf_if *ifp, bool rtnl_locked)
@@ -1105,7 +1103,6 @@ static int brcmf_bus_started(struct brcmf_pub *drvr, struct cfg80211_ops *ops)
 	brcmf_debugfs_add_entry(drvr, "revinfo", brcmf_revinfo_read);
 	brcmf_feat_debugfs_create(drvr);
 	brcmf_proto_debugfs_create(drvr);
-	brcmf_bus_debugfs_create(bus_if);
 
 	return 0;
 
@@ -1245,13 +1242,6 @@ void brcmf_detach(struct device *dev)
 
 	brcmf_bus_change_state(bus_if, BRCMF_BUS_DOWN);
 
-	brcmf_proto_detach_pre_delif(drvr);
-
-	if (drvr->mon_if) {
-		brcmf_net_detach(drvr->mon_if->ndev, false);
-		drvr->mon_if = NULL;
-	}
-
 	/* make sure primary interface removed last */
 	for (i = BRCMF_MAX_IFS-1; i > -1; i--)
 		brcmf_remove_interface(drvr->iflist[i], false);
@@ -1261,7 +1251,7 @@ void brcmf_detach(struct device *dev)
 
 	brcmf_bus_stop(drvr->bus_if);
 
-	brcmf_proto_detach_post_delif(drvr);
+	brcmf_proto_detach(drvr);
 
 	bus_if->drvr = NULL;
 	wiphy_free(drvr->wiphy);
@@ -1358,3 +1348,177 @@ void __exit brcmf_core_exit(void)
 #endif
 }
 
+int
+brcmf_pktfilter_add_remove(struct net_device *ndev, int filter_num, bool add)
+{
+	struct brcmf_if *ifp =  netdev_priv(ndev);
+	struct brcmf_pub *drvr = ifp->drvr;
+	struct brcmf_pkt_filter_le *pkt_filter;
+	int filter_fixed_len = offsetof(struct brcmf_pkt_filter_le, u);
+	int pattern_fixed_len = offsetof(struct brcmf_pkt_filter_pattern_le,
+				  mask_and_pattern);
+	u16 mask_and_pattern[MAX_PKTFILTER_PATTERN_SIZE];
+	int buflen = 0;
+	int ret = 0;
+
+	brcmf_dbg(INFO, "%s packet filter number %d\n",
+		  (add ? "add" : "remove"), filter_num);
+
+	pkt_filter = kzalloc(sizeof(*pkt_filter) +
+			(MAX_PKTFILTER_PATTERN_SIZE * 2), GFP_ATOMIC);
+	if (!pkt_filter)
+		return -ENOMEM;
+
+	switch (filter_num) {
+	case BRCMF_UNICAST_FILTER_NUM:
+		pkt_filter->id = 100;
+		pkt_filter->type = 0;
+		pkt_filter->negate_match = 0;
+		pkt_filter->u.pattern.offset = 0;
+		pkt_filter->u.pattern.size_bytes = 1;
+		mask_and_pattern[0] = 0x0001;
+		break;
+	case BRCMF_BROADCAST_FILTER_NUM:
+		//filter_pattern = "101 0 0 0 0xFFFFFFFFFFFF 0xFFFFFFFFFFFF";
+		pkt_filter->id = 101;
+		pkt_filter->type = 0;
+		pkt_filter->negate_match = 0;
+		pkt_filter->u.pattern.offset = 0;
+		pkt_filter->u.pattern.size_bytes = 6;
+		mask_and_pattern[0] = 0xFFFF;
+		mask_and_pattern[1] = 0xFFFF;
+		mask_and_pattern[2] = 0xFFFF;
+		mask_and_pattern[3] = 0xFFFF;
+		mask_and_pattern[4] = 0xFFFF;
+		mask_and_pattern[5] = 0xFFFF;
+		break;
+	case BRCMF_MULTICAST4_FILTER_NUM:
+		//filter_pattern = "102 0 0 0 0xFFFFFF 0x01005E";
+		pkt_filter->id = 102;
+		pkt_filter->type = 0;
+		pkt_filter->negate_match = 0;
+		pkt_filter->u.pattern.offset = 0;
+		pkt_filter->u.pattern.size_bytes = 3;
+		mask_and_pattern[0] = 0xFFFF;
+		mask_and_pattern[1] = 0x01FF;
+		mask_and_pattern[2] = 0x5E00;
+		break;
+	case BRCMF_MULTICAST6_FILTER_NUM:
+		//filter_pattern = "103 0 0 0 0xFFFF 0x3333";
+		pkt_filter->id = 103;
+		pkt_filter->type = 0;
+		pkt_filter->negate_match = 0;
+		pkt_filter->u.pattern.offset = 0;
+		pkt_filter->u.pattern.size_bytes = 2;
+		mask_and_pattern[0] = 0xFFFF;
+		mask_and_pattern[1] = 0x3333;
+		break;
+	case BRCMF_MDNS_FILTER_NUM:
+		//filter_pattern = "104 0 0 0 0xFFFFFFFFFFFF 0x01005E0000FB";
+		pkt_filter->id = 104;
+		pkt_filter->type = 0;
+		pkt_filter->negate_match = 0;
+		pkt_filter->u.pattern.offset = 0;
+		pkt_filter->u.pattern.size_bytes = 6;
+		mask_and_pattern[0] = 0xFFFF;
+		mask_and_pattern[1] = 0xFFFF;
+		mask_and_pattern[2] = 0xFFFF;
+		mask_and_pattern[3] = 0x0001;
+		mask_and_pattern[4] = 0x005E;
+		mask_and_pattern[5] = 0xFB00;
+		break;
+	case BRCMF_ARP_FILTER_NUM:
+		//filter_pattern = "105 0 0 12 0xFFFF 0x0806";
+		pkt_filter->id = 105;
+		pkt_filter->type = 0;
+		pkt_filter->negate_match = 0;
+		pkt_filter->u.pattern.offset = 12;
+		pkt_filter->u.pattern.size_bytes = 2;
+		mask_and_pattern[0] = 0xFFFF;
+		mask_and_pattern[1] = 0x0608;
+		break;
+	case BRCMF_BROADCAST_ARP_FILTER_NUM:
+		//filter_pattern = "106 0 0 0
+		//0xFFFFFFFFFFFF0000000000000806
+		//0xFFFFFFFFFFFF0000000000000806";
+		pkt_filter->id = 106;
+		pkt_filter->type = 0;
+		pkt_filter->negate_match = 0;
+		pkt_filter->u.pattern.offset = 0;
+		pkt_filter->u.pattern.size_bytes = 14;
+		mask_and_pattern[0] = 0xFFFF;
+		mask_and_pattern[1] = 0xFFFF;
+		mask_and_pattern[2] = 0xFFFF;
+		mask_and_pattern[3] = 0x0000;
+		mask_and_pattern[4] = 0x0000;
+		mask_and_pattern[5] = 0x0000;
+		mask_and_pattern[6] = 0x0608;
+		mask_and_pattern[7] = 0xFFFF;
+		mask_and_pattern[8] = 0xFFFF;
+		mask_and_pattern[9] = 0xFFFF;
+		mask_and_pattern[10] = 0x0000;
+		mask_and_pattern[11] = 0x0000;
+		mask_and_pattern[12] = 0x0000;
+		mask_and_pattern[13] = 0x0608;
+		break;
+	default:
+		ret = -EINVAL;
+		goto failed;
+	}
+	memcpy(pkt_filter->u.pattern.mask_and_pattern, mask_and_pattern,
+	       pkt_filter->u.pattern.size_bytes * 2);
+	buflen = filter_fixed_len + pattern_fixed_len +
+		  pkt_filter->u.pattern.size_bytes * 2;
+
+	if (add) {
+		/* Add filter */
+		ret = brcmf_fil_iovar_data_set(ifp, "pkt_filter_add",
+					       pkt_filter, buflen);
+		if (ret)
+			goto failed;
+		drvr->pkt_filter[filter_num].id = pkt_filter->id;
+		drvr->pkt_filter[filter_num].enable  = 0;
+
+	} else {
+		/* Delete filter */
+		ret = brcmf_fil_iovar_int_set(ifp, "pkt_filter_delete",
+					      pkt_filter->id);
+		if (ret == -ENOENT)
+			ret = 0;
+		if (ret)
+			goto failed;
+
+		drvr->pkt_filter[filter_num].id = 0;
+		drvr->pkt_filter[filter_num].enable  = 0;
+	}
+failed:
+	if (ret)
+		brcmf_err("%s packet filter failed, ret=%d\n",
+			  (add ? "add" : "remove"), ret);
+
+	kfree(pkt_filter);
+	return ret;
+}
+
+int brcmf_pktfilter_enable(struct net_device *ndev, bool enable)
+{
+	struct brcmf_if *ifp =  netdev_priv(ndev);
+	struct brcmf_pub *drvr = ifp->drvr;
+	int ret = 0;
+	int idx = 0;
+
+	for (idx = 0; idx < MAX_PKT_FILTER_COUNT; ++idx) {
+		if (drvr->pkt_filter[idx].id != 0) {
+			drvr->pkt_filter[idx].enable = enable;
+			ret = brcmf_fil_iovar_data_set(ifp, "pkt_filter_enable",
+						       &drvr->pkt_filter[idx],
+				sizeof(struct brcmf_pkt_filter_enable_le));
+			if (ret) {
+				brcmf_err("%s packet filter id(%d) failed, ret=%d\n",
+					  (enable ? "enable" : "disable"),
+					  drvr->pkt_filter[idx].id, ret);
+			}
+		}
+	}
+	return ret;
+}

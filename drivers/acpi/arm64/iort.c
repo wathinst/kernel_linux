@@ -616,8 +616,8 @@ static int iort_dev_find_its_id(struct device *dev, u32 req_id,
 
 	/* Move to ITS specific data */
 	its = (struct acpi_iort_its_group *)node->node_data;
-	if (idx >= its->its_count) {
-		dev_err(dev, "requested ITS ID index [%d] overruns ITS entries [%d]\n",
+	if (idx > its->its_count) {
+		dev_err(dev, "requested ITS ID index [%d] is greater than available [%d]\n",
 			idx, its->its_count);
 		return -ENXIO;
 	}
@@ -1231,24 +1231,18 @@ static bool __init arm_smmu_v3_is_coherent(struct acpi_iort_node *node)
 /*
  * set numa proximity domain for smmuv3 device
  */
-static int  __init arm_smmu_v3_set_proximity(struct device *dev,
+static void  __init arm_smmu_v3_set_proximity(struct device *dev,
 					      struct acpi_iort_node *node)
 {
 	struct acpi_iort_smmu_v3 *smmu;
 
 	smmu = (struct acpi_iort_smmu_v3 *)node->node_data;
 	if (smmu->flags & ACPI_IORT_SMMU_V3_PXM_VALID) {
-		int node = acpi_map_pxm_to_node(smmu->pxm);
-
-		if (node != NUMA_NO_NODE && !node_online(node))
-			return -EINVAL;
-
-		set_dev_node(dev, node);
+		set_dev_node(dev, acpi_map_pxm_to_node(smmu->pxm));
 		pr_info("SMMU-v3[%llx] Mapped to Proximity domain %d\n",
 			smmu->base_address,
 			smmu->pxm);
 	}
-	return 0;
 }
 #else
 #define arm_smmu_v3_set_proximity NULL
@@ -1323,7 +1317,7 @@ struct iort_dev_config {
 	int (*dev_count_resources)(struct acpi_iort_node *node);
 	void (*dev_init_resources)(struct resource *res,
 				     struct acpi_iort_node *node);
-	int (*dev_set_proximity)(struct device *dev,
+	void (*dev_set_proximity)(struct device *dev,
 				    struct acpi_iort_node *node);
 };
 
@@ -1374,11 +1368,8 @@ static int __init iort_add_platform_device(struct acpi_iort_node *node,
 	if (!pdev)
 		return -ENOMEM;
 
-	if (ops->dev_set_proximity) {
-		ret = ops->dev_set_proximity(&pdev->dev, node);
-		if (ret)
-			goto dev_put;
-	}
+	if (ops->dev_set_proximity)
+		ops->dev_set_proximity(&pdev->dev, node);
 
 	count = ops->dev_count_resources(node);
 

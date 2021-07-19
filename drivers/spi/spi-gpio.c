@@ -361,11 +361,6 @@ static inline int spi_gpio_probe_dt(struct platform_device *pdev)
 }
 #endif
 
-static void spi_gpio_put(void *data)
-{
-	spi_master_put(data);
-}
-
 static int spi_gpio_probe(struct platform_device *pdev)
 {
 	int				status;
@@ -391,12 +386,6 @@ static int spi_gpio_probe(struct platform_device *pdev)
 	if (!master)
 		return -ENOMEM;
 
-	status = devm_add_action_or_reset(&pdev->dev, spi_gpio_put, master);
-	if (status) {
-		spi_master_put(master);
-		return status;
-	}
-
 	spi_gpio = spi_master_get_devdata(master);
 
 	spi_gpio->cs_gpios = devm_kcalloc(&pdev->dev,
@@ -421,7 +410,7 @@ static int spi_gpio_probe(struct platform_device *pdev)
 		return status;
 
 	master->bits_per_word_mask = SPI_BPW_RANGE_MASK(1, 32);
-	master->mode_bits = SPI_3WIRE | SPI_CPHA | SPI_CPOL | SPI_CS_HIGH;
+	master->mode_bits = SPI_3WIRE | SPI_CPHA | SPI_CPOL;
 	master->flags = master_flags;
 	master->bus_num = pdev->id;
 	/* The master needs to think there is a chipselect even if not connected */
@@ -448,8 +437,13 @@ static int spi_gpio_probe(struct platform_device *pdev)
 		spi_gpio->bitbang.txrx_word[SPI_MODE_3] = spi_gpio_spec_txrx_word_mode3;
 	}
 	spi_gpio->bitbang.setup_transfer = spi_bitbang_setup_transfer;
+	spi_gpio->bitbang.flags = SPI_CS_HIGH;
 
-	return spi_bitbang_start(&spi_gpio->bitbang);
+	status = spi_bitbang_start(&spi_gpio->bitbang);
+	if (status)
+		spi_master_put(master);
+
+	return status;
 }
 
 static int spi_gpio_remove(struct platform_device *pdev)
@@ -462,6 +456,8 @@ static int spi_gpio_remove(struct platform_device *pdev)
 
 	/* stop() unregisters child devices too */
 	spi_bitbang_stop(&spi_gpio->bitbang);
+
+	spi_master_put(spi_gpio->bitbang.master);
 
 	return 0;
 }

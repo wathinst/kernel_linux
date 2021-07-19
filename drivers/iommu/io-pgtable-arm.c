@@ -14,6 +14,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *
  * Copyright (C) 2014 ARM Limited
+ * Copyright 2017 NXP
  *
  * Author: Will Deacon <will.deacon@arm.com>
  */
@@ -238,7 +239,7 @@ static void *__arm_lpae_alloc_pages(size_t size, gfp_t gfp,
 
 	VM_BUG_ON((gfp & __GFP_HIGHMEM));
 	p = alloc_pages_node(dev ? dev_to_node(dev) : NUMA_NO_NODE,
-			     gfp | __GFP_ZERO, order);
+			     gfp | __GFP_ZERO | __GFP_DMA32, order);
 	if (!p)
 		return NULL;
 
@@ -574,12 +575,13 @@ static size_t arm_lpae_split_blk_unmap(struct arm_lpae_io_pgtable *data,
 			return 0;
 
 		tablep = iopte_deref(pte, data);
-	} else if (unmap_idx >= 0) {
-		io_pgtable_tlb_add_flush(&data->iop, iova, size, size, true);
-		return size;
 	}
 
-	return __arm_lpae_unmap(data, iova, size, lvl, tablep);
+	if (unmap_idx < 0)
+		return __arm_lpae_unmap(data, iova, size, lvl, tablep);
+
+	io_pgtable_tlb_add_flush(&data->iop, iova, size, size, true);
+	return size;
 }
 
 static size_t __arm_lpae_unmap(struct arm_lpae_io_pgtable *data,

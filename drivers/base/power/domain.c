@@ -338,6 +338,9 @@ static int _genpd_power_on(struct generic_pm_domain *genpd, bool timed)
 	if (!genpd->power_on)
 		return 0;
 
+	pr_debug("%s: Power-%s (idle state %d timed %s)\n", genpd->name, "on",
+		 state_idx, timed ? "true" : "false");
+
 	if (!timed)
 		return genpd->power_on(genpd);
 
@@ -376,6 +379,9 @@ static int _genpd_power_off(struct generic_pm_domain *genpd, bool timed)
 
 	if (!genpd->power_off)
 		return 0;
+
+	pr_debug("%s: Power-%s (idle state %d timed %s)\n", genpd->name, "off",
+		 state_idx, timed ? "true" : "false");
 
 	if (!timed)
 		return genpd->power_off(genpd);
@@ -465,17 +471,24 @@ static int genpd_power_off(struct generic_pm_domain *genpd, bool one_dev_on,
 	if (genpd->gov && genpd->gov->power_down_ok) {
 		if (!genpd->gov->power_down_ok(&genpd->domain))
 			return -EAGAIN;
-	}
-
-	/* Default to shallowest state. */
-	if (!genpd->gov)
+	} else {
+		/*
+		 * if no valid state idx specified by governor, we use
+		 * the default state_idx 0 to enter in case the domain
+		 * has multi low power states.
+		 */
 		genpd->state_idx = 0;
+	}
 
 	if (genpd->power_off) {
 		int ret;
 
 		if (atomic_read(&genpd->sd_count) > 0)
 			return -EBUSY;
+
+		if (!genpd->device_count)
+			/* Choose the deepest state if no devices using this domain */
+			genpd->state_idx = genpd->state_count - 1;
 
 		/*
 		 * If sd_count > 0 at this point, one of the subdomains hasn't
@@ -887,7 +900,20 @@ static void genpd_sync_power_off(struct generic_pm_domain *genpd, bool use_lock,
 {
 	struct gpd_link *link;
 
-	if (!genpd_status_on(genpd) || genpd_is_always_on(genpd))
+	/*
+	 * Give the power domain a chance to switch to the deepest state in
+	 * case it's already off but in an intermediate low power state.
+	 * Due to power domain is alway off, so no need to check device wakeup
+	 * here anymore
+	 */
+
+	genpd->state_idx_saved = genpd->state_idx;
+
+	if (genpd_is_always_on(genpd))
+		return;
+
+	if (!genpd_status_on(genpd) &&
+	    genpd->state_idx == (genpd->state_count - 1))
 		return;
 
 	if (genpd->suspended_count != genpd->device_count
@@ -897,6 +923,9 @@ static void genpd_sync_power_off(struct generic_pm_domain *genpd, bool use_lock,
 	/* Choose the deepest state when suspending */
 	genpd->state_idx = genpd->state_count - 1;
 	if (_genpd_power_off(genpd, false))
+		return;
+
+	if (genpd->status == GPD_STATE_POWER_OFF)
 		return;
 
 	genpd->status = GPD_STATE_POWER_OFF;
@@ -946,6 +975,8 @@ static void genpd_sync_power_on(struct generic_pm_domain *genpd, bool use_lock,
 
 	_genpd_power_on(genpd, false);
 
+	/* restore save power domain state after resume */
+	genpd->state_idx = genpd->state_idx_saved;
 	genpd->status = GPD_STATE_ACTIVE;
 }
 
@@ -1392,11 +1423,11 @@ static int genpd_add_device(struct generic_pm_domain *genpd, struct device *dev,
 	if (IS_ERR(gpd_data))
 		return PTR_ERR(gpd_data);
 
+	genpd_lock(genpd);
+
 	ret = genpd->attach_dev ? genpd->attach_dev(genpd, dev) : 0;
 	if (ret)
 		goto out;
-
-	genpd_lock(genpd);
 
 	dev_pm_domain_set(dev, &genpd->domain);
 
@@ -1405,8 +1436,9 @@ static int genpd_add_device(struct generic_pm_domain *genpd, struct device *dev,
 
 	list_add_tail(&gpd_data->base.list_node, &genpd->dev_list);
 
-	genpd_unlock(genpd);
  out:
+	genpd_unlock(genpd);
+
 	if (ret)
 		genpd_free_dev_data(dev, gpd_data);
 	else
@@ -1455,14 +1487,14 @@ static int genpd_remove_device(struct generic_pm_domain *genpd,
 	genpd->device_count--;
 	genpd->max_off_time_changed = true;
 
+	if (genpd->detach_dev)
+		genpd->detach_dev(genpd, dev);
+
 	dev_pm_domain_set(dev, NULL);
 
 	list_del_init(&pdd->list_node);
 
 	genpd_unlock(genpd);
-
-	if (genpd->detach_dev)
-		genpd->detach_dev(genpd, dev);
 
 	genpd_free_dev_data(dev, gpd_data);
 
@@ -1690,8 +1722,6 @@ int pm_genpd_init(struct generic_pm_domain *genpd,
 		ret = genpd_set_default_power_state(genpd);
 		if (ret)
 			return ret;
-	} else if (!gov) {
-		pr_warn("%s : no governor for states\n", genpd->name);
 	}
 
 	device_initialize(&genpd->dev);
@@ -2049,7 +2079,7 @@ EXPORT_SYMBOL_GPL(of_genpd_del_provider);
  * Returns a valid pointer to struct generic_pm_domain on success or ERR_PTR()
  * on failure.
  */
-static struct generic_pm_domain *genpd_get_from_provider(
+struct generic_pm_domain *genpd_get_from_provider(
 					struct of_phandle_args *genpdspec)
 {
 	struct generic_pm_domain *genpd = ERR_PTR(-ENOENT);
@@ -2072,6 +2102,7 @@ static struct generic_pm_domain *genpd_get_from_provider(
 
 	return genpd;
 }
+EXPORT_SYMBOL_GPL(genpd_get_from_provider);
 
 /**
  * of_genpd_add_device() - Add a device to an I/O PM domain

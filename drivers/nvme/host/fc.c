@@ -206,7 +206,7 @@ static LIST_HEAD(nvme_fc_lport_list);
 static DEFINE_IDA(nvme_fc_local_port_cnt);
 static DEFINE_IDA(nvme_fc_ctrl_cnt);
 
-static struct workqueue_struct *nvme_fc_wq;
+
 
 /*
  * These items are short-term. They will eventually be moved into
@@ -1716,7 +1716,7 @@ __nvme_fc_init_request(struct nvme_fc_ctrl *ctrl,
 	if (fc_dma_mapping_error(ctrl->lport->dev, op->fcp_req.cmddma)) {
 		dev_err(ctrl->dev,
 			"FCP Op failed - cmdiu dma mapping failed.\n");
-		ret = -EFAULT;
+		ret = EFAULT;
 		goto out_on_error;
 	}
 
@@ -1726,7 +1726,7 @@ __nvme_fc_init_request(struct nvme_fc_ctrl *ctrl,
 	if (fc_dma_mapping_error(ctrl->lport->dev, op->fcp_req.rspdma)) {
 		dev_err(ctrl->dev,
 			"FCP Op failed - rspiu dma mapping failed.\n");
-		ret = -EFAULT;
+		ret = EFAULT;
 	}
 
 	atomic_set(&op->state, FCPOP_STATE_IDLE);
@@ -1791,7 +1791,6 @@ nvme_fc_term_aen_ops(struct nvme_fc_ctrl *ctrl)
 	struct nvme_fc_fcp_op *aen_op;
 	int i;
 
-	cancel_work_sync(&ctrl->ctrl.async_event_work);
 	aen_op = ctrl->aen_ops;
 	for (i = 0; i < NVME_NR_AEN_COMMANDS; i++, aen_op++) {
 		if (!aen_op->fcp_req.private)
@@ -1845,7 +1844,7 @@ nvme_fc_init_queue(struct nvme_fc_ctrl *ctrl, int idx)
 	memset(queue, 0, sizeof(*queue));
 	queue->ctrl = ctrl;
 	queue->qnum = idx;
-	atomic_set(&queue->csn, 0);
+	atomic_set(&queue->csn, 1);
 	queue->dev = ctrl->dev;
 
 	if (idx > 0)
@@ -1887,7 +1886,7 @@ nvme_fc_free_queue(struct nvme_fc_queue *queue)
 	 */
 
 	queue->connection_id = 0;
-	atomic_set(&queue->csn, 0);
+	atomic_set(&queue->csn, 1);
 }
 
 static void
@@ -2054,7 +2053,7 @@ nvme_fc_error_recovery(struct nvme_fc_ctrl *ctrl, char *errmsg)
 	 */
 	if (ctrl->ctrl.state == NVME_CTRL_CONNECTING) {
 		active = atomic_xchg(&ctrl->err_work_active, 1);
-		if (!active && !queue_work(nvme_fc_wq, &ctrl->err_work)) {
+		if (!active && !schedule_work(&ctrl->err_work)) {
 			atomic_set(&ctrl->err_work_active, 0);
 			WARN_ON(1);
 		}
@@ -2183,6 +2182,7 @@ nvme_fc_start_fcp_op(struct nvme_fc_ctrl *ctrl, struct nvme_fc_queue *queue,
 {
 	struct nvme_fc_cmd_iu *cmdiu = &op->cmd_iu;
 	struct nvme_command *sqe = &cmdiu->sqe;
+	u32 csn;
 	int ret, opstate;
 
 	/*
@@ -2197,6 +2197,8 @@ nvme_fc_start_fcp_op(struct nvme_fc_ctrl *ctrl, struct nvme_fc_queue *queue,
 
 	/* format the FC-NVME CMD IU and fcp_req */
 	cmdiu->connection_id = cpu_to_be64(queue->connection_id);
+	csn = atomic_inc_return(&queue->csn);
+	cmdiu->csn = cpu_to_be32(csn);
 	cmdiu->data_len = cpu_to_be32(data_len);
 	switch (io_dir) {
 	case NVMEFC_FCP_WRITE:
@@ -2254,24 +2256,11 @@ nvme_fc_start_fcp_op(struct nvme_fc_ctrl *ctrl, struct nvme_fc_queue *queue,
 	if (!(op->flags & FCOP_FLAGS_AEN))
 		blk_mq_start_request(op->rq);
 
-	cmdiu->csn = cpu_to_be32(atomic_inc_return(&queue->csn));
 	ret = ctrl->lport->ops->fcp_io(&ctrl->lport->localport,
 					&ctrl->rport->remoteport,
 					queue->lldd_handle, &op->fcp_req);
 
 	if (ret) {
-		/*
-		 * If the lld fails to send the command is there an issue with
-		 * the csn value?  If the command that fails is the Connect,
-		 * no - as the connection won't be live.  If it is a command
-		 * post-connect, it's possible a gap in csn may be created.
-		 * Does this matter?  As Linux initiators don't send fused
-		 * commands, no.  The gap would exist, but as there's nothing
-		 * that depends on csn order to be delivered on the target
-		 * side, it shouldn't hurt.  It would be difficult for a
-		 * target to even detect the csn gap as it has no idea when the
-		 * cmd with the csn was supposed to arrive.
-		 */
 		opstate = atomic_xchg(&op->state, FCPOP_STATE_COMPLETE);
 		__nvme_fc_fcpop_chk_teardowns(ctrl, op, opstate);
 
@@ -2892,22 +2881,10 @@ nvme_fc_reconnect_or_delete(struct nvme_fc_ctrl *ctrl, int status)
 static void
 __nvme_fc_terminate_io(struct nvme_fc_ctrl *ctrl)
 {
-	/*
-	 * if state is connecting - the error occurred as part of a
-	 * reconnect attempt. The create_association error paths will
-	 * clean up any outstanding io.
-	 *
-	 * if it's a different state - ensure all pending io is
-	 * terminated. Given this can delay while waiting for the
-	 * aborted io to return, we recheck adapter state below
-	 * before changing state.
-	 */
-	if (ctrl->ctrl.state != NVME_CTRL_CONNECTING) {
-		nvme_stop_keep_alive(&ctrl->ctrl);
+	nvme_stop_keep_alive(&ctrl->ctrl);
 
-		/* will block will waiting for io to terminate */
-		nvme_fc_delete_association(ctrl);
-	}
+	/* will block will waiting for io to terminate */
+	nvme_fc_delete_association(ctrl);
 
 	if (ctrl->ctrl.state != NVME_CTRL_CONNECTING &&
 	    !nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_CONNECTING))
@@ -3294,14 +3271,12 @@ nvme_fc_create_ctrl(struct device *dev, struct nvmf_ctrl_options *opts)
 	spin_lock_irqsave(&nvme_fc_lock, flags);
 	list_for_each_entry(lport, &nvme_fc_lport_list, port_list) {
 		if (lport->localport.node_name != laddr.nn ||
-		    lport->localport.port_name != laddr.pn ||
-		    lport->localport.port_state != FC_OBJSTATE_ONLINE)
+		    lport->localport.port_name != laddr.pn)
 			continue;
 
 		list_for_each_entry(rport, &lport->endp_list, endp_list) {
 			if (rport->remoteport.node_name != raddr.nn ||
-			    rport->remoteport.port_name != raddr.pn ||
-			    rport->remoteport.port_state != FC_OBJSTATE_ONLINE)
+			    rport->remoteport.port_name != raddr.pn)
 				continue;
 
 			/* if fail to get reference fall through. Will error */
@@ -3336,10 +3311,6 @@ static int __init nvme_fc_init_module(void)
 {
 	int ret;
 
-	nvme_fc_wq = alloc_workqueue("nvme_fc_wq", WQ_MEM_RECLAIM, 0);
-	if (!nvme_fc_wq)
-		return -ENOMEM;
-
 	/*
 	 * NOTE:
 	 * It is expected that in the future the kernel will combine
@@ -3357,8 +3328,7 @@ static int __init nvme_fc_init_module(void)
 	fc_class = class_create(THIS_MODULE, "fc");
 	if (IS_ERR(fc_class)) {
 		pr_err("couldn't register class fc\n");
-		ret = PTR_ERR(fc_class);
-		goto out_destroy_wq;
+		return PTR_ERR(fc_class);
 	}
 
 	/*
@@ -3382,9 +3352,6 @@ out_destroy_device:
 	device_destroy(fc_class, MKDEV(0, 0));
 out_destroy_class:
 	class_destroy(fc_class);
-out_destroy_wq:
-	destroy_workqueue(nvme_fc_wq);
-
 	return ret;
 }
 
@@ -3401,7 +3368,6 @@ static void __exit nvme_fc_exit_module(void)
 
 	device_destroy(fc_class, MKDEV(0, 0));
 	class_destroy(fc_class);
-	destroy_workqueue(nvme_fc_wq);
 }
 
 module_init(nvme_fc_init_module);

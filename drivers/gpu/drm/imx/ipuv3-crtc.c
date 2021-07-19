@@ -28,6 +28,7 @@
 
 #include <video/imx-ipu-v3.h>
 #include "imx-drm.h"
+#include "ipuv3-kms.h"
 #include "ipuv3-plane.h"
 
 #define DRIVER_DESC		"i.MX IPUv3 Graphics"
@@ -78,7 +79,7 @@ static void ipu_crtc_disable_planes(struct ipu_crtc *ipu_crtc,
 	if (disable_partial)
 		ipu_plane_disable(ipu_crtc->plane[1], true);
 	if (disable_full)
-		ipu_plane_disable(ipu_crtc->plane[0], true);
+		ipu_plane_disable(ipu_crtc->plane[0], false);
 }
 
 static void ipu_crtc_atomic_disable(struct drm_crtc *crtc,
@@ -98,14 +99,14 @@ static void ipu_crtc_atomic_disable(struct drm_crtc *crtc,
 	ipu_dc_disable(ipu);
 	ipu_prg_disable(ipu);
 
-	drm_crtc_vblank_off(crtc);
-
 	spin_lock_irq(&crtc->dev->event_lock);
-	if (crtc->state->event && !crtc->state->active) {
+	if (crtc->state->event) {
 		drm_crtc_send_vblank_event(crtc, crtc->state->event);
 		crtc->state->event = NULL;
 	}
 	spin_unlock_irq(&crtc->dev->event_lock);
+
+	drm_crtc_vblank_off(crtc);
 }
 
 static void imx_drm_crtc_reset(struct drm_crtc *crtc)
@@ -428,6 +429,12 @@ static int ipu_drm_bind(struct device *dev, struct device *master, void *data)
 	if (ret)
 		return ret;
 
+	if (!drm->mode_config.funcs)
+		drm->mode_config.funcs = &ipuv3_drm_mode_config_funcs;
+	if (!drm->mode_config.helper_private)
+		drm->mode_config.helper_private =
+					&ipuv3_drm_mode_config_helpers;
+
 	dev_set_drvdata(dev, ipu_crtc);
 
 	return 0;
@@ -470,10 +477,16 @@ static int ipu_drm_remove(struct platform_device *pdev)
 	return 0;
 }
 
-struct platform_driver ipu_drm_driver = {
+static struct platform_driver ipu_drm_driver = {
 	.driver = {
 		.name = "imx-ipuv3-crtc",
 	},
 	.probe = ipu_drm_probe,
 	.remove = ipu_drm_remove,
 };
+module_platform_driver(ipu_drm_driver);
+
+MODULE_AUTHOR("Sascha Hauer <s.hauer@pengutronix.de>");
+MODULE_DESCRIPTION(DRIVER_DESC);
+MODULE_LICENSE("GPL");
+MODULE_ALIAS("platform:imx-ipuv3-crtc");

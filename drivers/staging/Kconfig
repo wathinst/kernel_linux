@@ -126,8 +126,4 @@ source "drivers/staging/axis-fifo/Kconfig"
 
 source "drivers/staging/erofs/Kconfig"
 
-source "drivers/staging/hilog/Kconfig"
-
-source "drivers/staging/hievent/Kconfig"
-
 endif # STAGING

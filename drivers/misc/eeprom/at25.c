@@ -253,7 +253,7 @@ static int at25_fw_to_chip(struct device *dev, struct spi_eeprom *chip)
 	u32 val;
 
 	memset(chip, 0, sizeof(*chip));
-	strncpy(chip->name, "at25", sizeof(chip->name));
+	strlcpy(chip->name, "at25", sizeof(chip->name));
 
 	if (device_property_read_u32(dev, "size", &val) == 0 ||
 	    device_property_read_u32(dev, "at25,byte-len", &val) == 0) {
@@ -362,7 +362,7 @@ static int at25_probe(struct spi_device *spi)
 	at25->nvmem_config.reg_read = at25_ee_read;
 	at25->nvmem_config.reg_write = at25_ee_write;
 	at25->nvmem_config.priv = at25;
-	at25->nvmem_config.stride = 1;
+	at25->nvmem_config.stride = 4;
 	at25->nvmem_config.word_size = 1;
 	at25->nvmem_config.size = chip.byte_len;
 

@@ -25,11 +25,10 @@ extern int nvdimm_major;
 
 struct nvdimm_bus {
 	struct nvdimm_bus_descriptor *nd_desc;
-	wait_queue_head_t wait;
+	wait_queue_head_t probe_wait;
 	struct list_head list;
 	struct device dev;
 	int id, probe_active;
-	atomic_t ioctl_active;
 	struct list_head mapping_list;
 	struct mutex reconfig_mutex;
 	struct badrange badrange;

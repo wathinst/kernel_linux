@@ -18,6 +18,7 @@
 
 #include <linux/device.h>
 #include <linux/of.h>
+#include <linux/of_gpio.h>
 #include <linux/pinctrl/pinctrl.h>
 #include <linux/slab.h>
 
@@ -40,13 +41,6 @@ struct pinctrl_dt_map {
 static void dt_free_map(struct pinctrl_dev *pctldev,
 		     struct pinctrl_map *map, unsigned num_maps)
 {
-	int i;
-
-	for (i = 0; i < num_maps; ++i) {
-		kfree_const(map[i].dev_name);
-		map[i].dev_name = NULL;
-	}
-
 	if (pctldev) {
 		const struct pinctrl_ops *ops = pctldev->desc->pctlops;
 		if (ops->dt_free_map)
@@ -81,13 +75,7 @@ static int dt_remember_or_free_map(struct pinctrl *p, const char *statename,
 
 	/* Initialize common mapping table entry fields */
 	for (i = 0; i < num_maps; i++) {
-		const char *devname;
-
-		devname = kstrdup_const(dev_name(p->dev), GFP_KERNEL);
-		if (!devname)
-			goto err_free_map;
-
-		map[i].dev_name = devname;
+		map[i].dev_name = dev_name(p->dev);
 		map[i].name = statename;
 		if (pctldev)
 			map[i].ctrl_dev_name = dev_name(pctldev->dev);
@@ -95,8 +83,10 @@ static int dt_remember_or_free_map(struct pinctrl *p, const char *statename,
 
 	/* Remember the converted mapping table entries */
 	dt_map = kzalloc(sizeof(*dt_map), GFP_KERNEL);
-	if (!dt_map)
-		goto err_free_map;
+	if (!dt_map) {
+		dt_free_map(pctldev, map, num_maps);
+		return -ENOMEM;
+	}
 
 	dt_map->pctldev = pctldev;
 	dt_map->map = map;
@@ -104,10 +94,6 @@ static int dt_remember_or_free_map(struct pinctrl *p, const char *statename,
 	list_add_tail(&dt_map->node, &p->dt_maps);
 
 	return pinctrl_register_map(map, num_maps, false);
-
-err_free_map:
-	dt_free_map(pctldev, map, num_maps);
-	return -ENOMEM;
 }
 
 struct pinctrl_dev *of_pinctrl_get(struct device_node *np)
@@ -208,6 +194,46 @@ bool pinctrl_dt_has_hogs(struct pinctrl_dev *pctldev)
 	return prop ? true : false;
 }
 
+static int dt_gpio_assert_pinctrl(struct pinctrl *p)
+{
+	struct device_node *np = p->dev->of_node;
+	enum of_gpio_flags flags;
+	int gpio;
+	int index = 0;
+	int ret;
+
+	if (!of_find_property(np, "pinctrl-assert-gpios", NULL))
+		return 0; /* Missing the property, so nothing to be done */
+
+	for (;; index++) {
+		gpio = of_get_named_gpio_flags(np, "pinctrl-assert-gpios",
+					       index, &flags);
+		if (gpio < 0) {
+			if (gpio == -EPROBE_DEFER)
+				return gpio;
+			break; /* End of the phandle list */
+		}
+
+		if (!gpio_is_valid(gpio))
+			return -EINVAL;
+
+		ret = devm_gpio_request_one(p->dev, gpio, GPIOF_OUT_INIT_LOW,
+					    NULL);
+		if (ret < 0)
+			return ret;
+
+		if (flags & OF_GPIO_ACTIVE_LOW)
+			continue;
+
+		if (gpio_cansleep(gpio))
+			gpio_set_value_cansleep(gpio, 1);
+		else
+			gpio_set_value(gpio, 1);
+	}
+
+	return 0;
+}
+
 int pinctrl_dt_to_map(struct pinctrl *p, struct pinctrl_dev *pctldev)
 {
 	struct device_node *np = p->dev->of_node;
@@ -226,6 +252,12 @@ int pinctrl_dt_to_map(struct pinctrl *p, struct pinctrl_dev *pctldev)
 			dev_dbg(p->dev,
 				"no of_node; not parsing pinctrl DT\n");
 		return 0;
+	}
+
+	ret = dt_gpio_assert_pinctrl(p);
+	if (ret) {
+		dev_dbg(p->dev, "failed to assert pinctrl setting: %d\n", ret);
+		return ret;
 	}
 
 	/* We may store pointers to property names within the node */

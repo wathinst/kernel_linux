@@ -438,10 +438,9 @@ static int reset_rx_pools(struct ibmvnic_adapter *adapter)
 		if (rx_pool->buff_size != be64_to_cpu(size_array[i])) {
 			free_long_term_buff(adapter, &rx_pool->long_term_buff);
 			rx_pool->buff_size = be64_to_cpu(size_array[i]);
-			rc = alloc_long_term_buff(adapter,
-						  &rx_pool->long_term_buff,
-						  rx_pool->size *
-						  rx_pool->buff_size);
+			alloc_long_term_buff(adapter, &rx_pool->long_term_buff,
+					     rx_pool->size *
+					     rx_pool->buff_size);
 		} else {
 			rc = reset_long_term_buff(adapter,
 						  &rx_pool->long_term_buff);
@@ -707,9 +706,9 @@ static int init_tx_pools(struct net_device *netdev)
 			return rc;
 		}
 
-		rc = init_one_tx_pool(netdev, &adapter->tso_pool[i],
-				      IBMVNIC_TSO_BUFS,
-				      IBMVNIC_TSO_BUF_SZ);
+		init_one_tx_pool(netdev, &adapter->tso_pool[i],
+				 IBMVNIC_TSO_BUFS,
+				 IBMVNIC_TSO_BUF_SZ);
 		if (rc) {
 			release_tx_pools(adapter);
 			return rc;
@@ -792,13 +791,12 @@ static int ibmvnic_login(struct net_device *netdev)
 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
 	unsigned long timeout = msecs_to_jiffies(30000);
 	int retry_count = 0;
-	int retries = 10;
 	bool retry;
 	int rc;
 
 	do {
 		retry = false;
-		if (retry_count > retries) {
+		if (retry_count > IBMVNIC_MAX_QUEUES) {
 			netdev_warn(netdev, "Login attempts exceeded\n");
 			return -1;
 		}
@@ -813,23 +811,11 @@ static int ibmvnic_login(struct net_device *netdev)
 
 		if (!wait_for_completion_timeout(&adapter->init_done,
 						 timeout)) {
-			netdev_warn(netdev, "Login timed out, retrying...\n");
-			retry = true;
-			adapter->init_done_rc = 0;
-			retry_count++;
-			continue;
+			netdev_warn(netdev, "Login timed out\n");
+			return -1;
 		}
 
-		if (adapter->init_done_rc == ABORTED) {
-			netdev_warn(netdev, "Login aborted, retrying...\n");
-			retry = true;
-			adapter->init_done_rc = 0;
-			retry_count++;
-			/* FW or device may be busy, so
-			 * wait a bit before retrying login
-			 */
-			msleep(500);
-		} else if (adapter->init_done_rc == PARTIALSUCCESS) {
+		if (adapter->init_done_rc == PARTIALSUCCESS) {
 			retry_count++;
 			release_sub_crqs(adapter, 1);
 
@@ -1433,7 +1419,7 @@ static int ibmvnic_xmit_workarounds(struct sk_buff *skb,
 	return 0;
 }
 
-static netdev_tx_t ibmvnic_xmit(struct sk_buff *skb, struct net_device *netdev)
+static int ibmvnic_xmit(struct sk_buff *skb, struct net_device *netdev)
 {
 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
 	int queue_num = skb_get_queue_mapping(skb);
@@ -1457,7 +1443,7 @@ static netdev_tx_t ibmvnic_xmit(struct sk_buff *skb, struct net_device *netdev)
 	u64 *handle_array;
 	int index = 0;
 	u8 proto = 0;
-	netdev_tx_t ret = NETDEV_TX_OK;
+	int ret = 0;
 
 	if (adapter->resetting) {
 		if (!netif_subqueue_stopped(netdev, skb))
@@ -1599,8 +1585,6 @@ static netdev_tx_t ibmvnic_xmit(struct sk_buff *skb, struct net_device *netdev)
 		lpar_rc = send_subcrq_indirect(adapter, handle_array[queue_num],
 					       (u64)tx_buff->indir_dma,
 					       (u64)num_entries);
-		dma_unmap_single(dev, tx_buff->indir_dma,
-				 sizeof(tx_buff->indir_arr), DMA_TO_DEVICE);
 	} else {
 		tx_buff->num_entries = num_entries;
 		lpar_rc = send_subcrq(adapter, handle_array[queue_num],
@@ -1770,8 +1754,7 @@ static int do_reset(struct ibmvnic_adapter *adapter,
 
 	ibmvnic_cleanup(netdev);
 
-	if (reset_state == VNIC_OPEN &&
-	    adapter->reset_reason != VNIC_RESET_MOBILITY &&
+	if (adapter->reset_reason != VNIC_RESET_MOBILITY &&
 	    adapter->reset_reason != VNIC_RESET_FAILOVER) {
 		rc = __ibmvnic_close(netdev);
 		if (rc)
@@ -1870,16 +1853,13 @@ static int do_reset(struct ibmvnic_adapter *adapter,
 		return 0;
 	}
 
-	/* refresh device's multicast list */
-	ibmvnic_set_multi(netdev);
-
 	/* kick napi */
 	for (i = 0; i < adapter->req_rx_queues; i++)
 		napi_schedule(&adapter->napi[i]);
 
 	if (adapter->reset_reason != VNIC_RESET_FAILOVER &&
 	    adapter->reset_reason != VNIC_RESET_CHANGE_PARAM)
-		call_netdevice_notifiers(NETDEV_NOTIFY_PEERS, netdev);
+		netdev_notify_peers(netdev);
 
 	netif_carrier_on(netdev);
 
@@ -2011,13 +1991,6 @@ static void __ibmvnic_reset(struct work_struct *work)
 
 	rwi = get_next_rwi(adapter);
 	while (rwi) {
-		if (adapter->state == VNIC_REMOVING ||
-		    adapter->state == VNIC_REMOVED) {
-			kfree(rwi);
-			rc = EBUSY;
-			break;
-		}
-
 		if (adapter->force_reset_recovery) {
 			adapter->force_reset_recovery = false;
 			rc = do_hard_reset(adapter, rwi, reset_state);
@@ -2769,6 +2742,7 @@ static int ibmvnic_complete_tx(struct ibmvnic_adapter *adapter,
 	union sub_crq *next;
 	int index;
 	int i, j;
+	u8 *first;
 
 restart_loop:
 	while (pending_scrq(adapter, scrq)) {
@@ -2797,6 +2771,14 @@ restart_loop:
 					continue;
 
 				txbuff->data_dma[j] = 0;
+			}
+			/* if sub_crq was sent indirectly */
+			first = &txbuff->indir_arr[0].generic.first;
+			if (*first == IBMVNIC_CRQ_CMD) {
+				dma_unmap_single(dev, txbuff->indir_dma,
+						 sizeof(txbuff->indir_arr),
+						 DMA_TO_DEVICE);
+				*first = 0;
 			}
 
 			if (txbuff->last_frag) {
@@ -2926,7 +2908,7 @@ req_rx_irq_failed:
 req_tx_irq_failed:
 	for (j = 0; j < i; j++) {
 		free_irq(adapter->tx_scrq[j]->irq, adapter->tx_scrq[j]);
-		irq_dispose_mapping(adapter->tx_scrq[j]->irq);
+		irq_dispose_mapping(adapter->rx_scrq[j]->irq);
 	}
 	release_sub_crqs(adapter, 1);
 	return rc;
@@ -4308,10 +4290,12 @@ static void ibmvnic_handle_crq(union ibmvnic_crq *crq,
 			dev_err(dev, "Error %ld in VERSION_EXCHG_RSP\n", rc);
 			break;
 		}
-		ibmvnic_version =
-			    be16_to_cpu(crq->version_exchange_rsp.version);
 		dev_info(dev, "Partner protocol version is %d\n",
-			 ibmvnic_version);
+			 crq->version_exchange_rsp.version);
+		if (be16_to_cpu(crq->version_exchange_rsp.version) <
+		    ibmvnic_version)
+			ibmvnic_version =
+			    be16_to_cpu(crq->version_exchange_rsp.version);
 		send_cap_queries(adapter);
 		break;
 	case QUERY_CAPABILITY_RSP:

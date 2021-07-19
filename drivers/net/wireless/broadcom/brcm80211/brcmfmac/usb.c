@@ -30,6 +30,7 @@
 #include "core.h"
 #include "common.h"
 #include "bcdc.h"
+#include "cfg80211.h"
 
 
 #define IOCTL_RESP_TIMEOUT		msecs_to_jiffies(2000)
@@ -160,7 +161,7 @@ struct brcmf_usbdev_info {
 
 	struct usb_device *usbdev;
 	struct device *dev;
-	struct completion dev_init_done;
+	struct mutex dev_init_lock;
 
 	int ctl_in_pipe, ctl_out_pipe;
 	struct urb *ctl_urb; /* URB for control endpoint */
@@ -441,7 +442,6 @@ fail:
 			usb_free_urb(req->urb);
 		list_del(q->next);
 	}
-	kfree(reqs);
 	return NULL;
 
 }
@@ -685,18 +685,12 @@ static int brcmf_usb_up(struct device *dev)
 
 static void brcmf_cancel_all_urbs(struct brcmf_usbdev_info *devinfo)
 {
-	int i;
-
 	if (devinfo->ctl_urb)
 		usb_kill_urb(devinfo->ctl_urb);
 	if (devinfo->bulk_urb)
 		usb_kill_urb(devinfo->bulk_urb);
-	if (devinfo->tx_reqs)
-		for (i = 0; i < devinfo->bus_pub.ntxq; i++)
-			usb_kill_urb(devinfo->tx_reqs[i].urb);
-	if (devinfo->rx_reqs)
-		for (i = 0; i < devinfo->bus_pub.nrxq; i++)
-			usb_kill_urb(devinfo->rx_reqs[i].urb);
+	brcmf_usb_free_q(&devinfo->tx_postq, true);
+	brcmf_usb_free_q(&devinfo->rx_postq, true);
 }
 
 static void brcmf_usb_down(struct device *dev)
@@ -1202,11 +1196,11 @@ static void brcmf_usb_probe_phase2(struct device *dev, int ret,
 	if (ret)
 		goto error;
 
-	complete(&devinfo->dev_init_done);
+	mutex_unlock(&devinfo->dev_init_lock);
 	return;
 error:
 	brcmf_dbg(TRACE, "failed: dev=%s, err=%d\n", dev_name(dev), ret);
-	complete(&devinfo->dev_init_done);
+	mutex_unlock(&devinfo->dev_init_lock);
 	device_release_driver(dev);
 }
 
@@ -1274,7 +1268,7 @@ static int brcmf_usb_probe_cb(struct brcmf_usbdev_info *devinfo)
 		if (ret)
 			goto fail;
 		/* we are done */
-		complete(&devinfo->dev_init_done);
+		mutex_unlock(&devinfo->dev_init_lock);
 		return 0;
 	}
 	bus->chip = bus_pub->devid;
@@ -1334,10 +1328,11 @@ brcmf_usb_probe(struct usb_interface *intf, const struct usb_device_id *id)
 
 	devinfo->usbdev = usb;
 	devinfo->dev = &usb->dev;
-	/* Init completion, to protect for disconnect while still loading.
+	/* Take an init lock, to protect for disconnect while still loading.
 	 * Necessary because of the asynchronous firmware load construction
 	 */
-	init_completion(&devinfo->dev_init_done);
+	mutex_init(&devinfo->dev_init_lock);
+	mutex_lock(&devinfo->dev_init_lock);
 
 	usb_set_intfdata(intf, devinfo);
 
@@ -1358,7 +1353,7 @@ brcmf_usb_probe(struct usb_interface *intf, const struct usb_device_id *id)
 		goto fail;
 	}
 
-	desc = &intf->cur_altsetting->desc;
+	desc = &intf->altsetting[0].desc;
 	if ((desc->bInterfaceClass != USB_CLASS_VENDOR_SPEC) ||
 	    (desc->bInterfaceSubClass != 2) ||
 	    (desc->bInterfaceProtocol != 0xff)) {
@@ -1371,7 +1366,7 @@ brcmf_usb_probe(struct usb_interface *intf, const struct usb_device_id *id)
 
 	num_of_eps = desc->bNumEndpoints;
 	for (ep = 0; ep < num_of_eps; ep++) {
-		endpoint = &intf->cur_altsetting->endpoint[ep].desc;
+		endpoint = &intf->altsetting[0].endpoint[ep].desc;
 		endpoint_num = usb_endpoint_num(endpoint);
 		if (!usb_endpoint_xfer_bulk(endpoint))
 			continue;
@@ -1415,7 +1410,7 @@ brcmf_usb_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	return 0;
 
 fail:
-	complete(&devinfo->dev_init_done);
+	mutex_unlock(&devinfo->dev_init_lock);
 	kfree(devinfo);
 	usb_set_intfdata(intf, NULL);
 	return ret;
@@ -1430,7 +1425,7 @@ brcmf_usb_disconnect(struct usb_interface *intf)
 	devinfo = (struct brcmf_usbdev_info *)usb_get_intfdata(intf);
 
 	if (devinfo) {
-		wait_for_completion(&devinfo->dev_init_done);
+		mutex_lock(&devinfo->dev_init_lock);
 		/* Make sure that devinfo still exists. Firmware probe routines
 		 * may have released the device and cleared the intfdata.
 		 */
@@ -1451,8 +1446,22 @@ static int brcmf_usb_suspend(struct usb_interface *intf, pm_message_t state)
 {
 	struct usb_device *usb = interface_to_usbdev(intf);
 	struct brcmf_usbdev_info *devinfo = brcmf_usb_get_businfo(&usb->dev);
+	struct brcmf_bus *bus;
+	struct brcmf_cfg80211_info *config;
+	int retry = BRCMF_PM_WAIT_MAXRETRY;
 
 	brcmf_dbg(USB, "Enter\n");
+
+	bus = devinfo->bus_pub.bus;
+	config = bus->drvr->config;
+	while (retry &&
+	       config->pm_state == BRCMF_CFG80211_PM_STATE_SUSPENDING) {
+		usleep_range(10000, 20000);
+		retry--;
+	}
+	if (!retry && config->pm_state == BRCMF_CFG80211_PM_STATE_SUSPENDING)
+		brcmf_err("timed out wait for cfg80211 suspended\n");
+
 	devinfo->bus_pub.state = BRCMFMAC_USB_STATE_SLEEP;
 	if (devinfo->wowl_enabled)
 		brcmf_cancel_all_urbs(devinfo);

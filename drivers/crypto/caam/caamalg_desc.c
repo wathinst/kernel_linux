@@ -1,7 +1,7 @@
 /*
  * Shared descriptors for aead, ablkcipher algorithms
  *
- * Copyright 2016 NXP
+ * Copyright 2016-2019 NXP
  */
 
 #include "compat.h"
@@ -509,7 +509,6 @@ void cnstr_shdsc_aead_givencap(u32 * const desc, struct alginfo *cdata,
 			       const bool is_qi, int era)
 {
 	u32 geniv, moveiv;
-	u32 *wait_cmd;
 
 	/* Note: Context registers are saved. */
 	init_sh_desc_key_aead(desc, cdata, adata, is_rfc3686, nonce, era);
@@ -605,14 +604,6 @@ copy_iv:
 
 	/* Will read cryptlen */
 	append_math_add(desc, VARSEQINLEN, SEQINLEN, REG0, CAAM_CMD_SZ);
-
-	/*
-	 * Wait for IV transfer (ofifo -> class2) to finish before starting
-	 * ciphertext transfer (ofifo -> external memory).
-	 */
-	wait_cmd = append_jump(desc, JUMP_JSL | JUMP_TEST_ALL | JUMP_COND_NIFP);
-	set_jump_tgt_here(desc, wait_cmd);
-
 	append_seq_fifo_load(desc, 0, FIFOLD_CLASS_BOTH | KEY_VLF |
 			     FIFOLD_TYPE_MSG1OUT2 | FIFOLD_TYPE_LASTBOTH);
 	append_seq_fifo_store(desc, 0, FIFOST_TYPE_MESSAGE_DATA | KEY_VLF);
@@ -1249,6 +1240,7 @@ void cnstr_shdsc_ablkcipher_encap(u32 * const desc, struct alginfo *cdata,
 				  const u32 ctx1_iv_off)
 {
 	u32 *key_jump_cmd;
+	u32 key_option;
 
 	init_sh_desc(desc, HDR_SHARE_SERIAL | HDR_SAVECTX);
 	/* Skip if already shared */
@@ -1256,8 +1248,13 @@ void cnstr_shdsc_ablkcipher_encap(u32 * const desc, struct alginfo *cdata,
 				   JUMP_COND_SHRD);
 
 	/* Load class1 key only */
-	append_key_as_imm(desc, cdata->key_virt, cdata->keylen,
-			  cdata->keylen, CLASS_1 | KEY_DEST_CLASS_REG);
+	key_option = CLASS_1 | KEY_DEST_CLASS_REG | cdata->key_cmd_opt;
+	if (cdata->key_inline)
+		append_key_as_imm(desc, cdata->key_virt, cdata->keylen,
+				  cdata->key_real_len, key_option);
+	else
+		append_key(desc, cdata->key_dma, cdata->key_real_len,
+			   key_option);
 
 	/* Load nonce into CONTEXT1 reg */
 	if (is_rfc3686) {
@@ -1273,9 +1270,11 @@ void cnstr_shdsc_ablkcipher_encap(u32 * const desc, struct alginfo *cdata,
 
 	set_jump_tgt_here(desc, key_jump_cmd);
 
-	/* Load iv */
-	append_seq_load(desc, ivsize, LDST_SRCDST_BYTE_CONTEXT |
-			LDST_CLASS_1_CCB | (ctx1_iv_off << LDST_OFFSET_SHIFT));
+	/* Load IV, if there is one */
+	if (ivsize)
+		append_seq_load(desc, ivsize, LDST_SRCDST_BYTE_CONTEXT |
+				LDST_CLASS_1_CCB | (ctx1_iv_off <<
+				LDST_OFFSET_SHIFT));
 
 	/* Load counter into CONTEXT1 reg */
 	if (is_rfc3686)
@@ -1314,6 +1313,7 @@ void cnstr_shdsc_ablkcipher_decap(u32 * const desc, struct alginfo *cdata,
 				  const u32 ctx1_iv_off)
 {
 	u32 *key_jump_cmd;
+	u32 key_option;
 
 	init_sh_desc(desc, HDR_SHARE_SERIAL | HDR_SAVECTX);
 	/* Skip if already shared */
@@ -1321,8 +1321,13 @@ void cnstr_shdsc_ablkcipher_decap(u32 * const desc, struct alginfo *cdata,
 				   JUMP_COND_SHRD);
 
 	/* Load class1 key only */
-	append_key_as_imm(desc, cdata->key_virt, cdata->keylen,
-			  cdata->keylen, CLASS_1 | KEY_DEST_CLASS_REG);
+	key_option = CLASS_1 | KEY_DEST_CLASS_REG | cdata->key_cmd_opt;
+	if (cdata->key_inline)
+		append_key_as_imm(desc, cdata->key_virt, cdata->keylen,
+				  cdata->key_real_len, key_option);
+	else
+		append_key(desc, cdata->key_dma, cdata->key_real_len,
+			   key_option);
 
 	/* Load nonce into CONTEXT1 reg */
 	if (is_rfc3686) {
@@ -1338,9 +1343,11 @@ void cnstr_shdsc_ablkcipher_decap(u32 * const desc, struct alginfo *cdata,
 
 	set_jump_tgt_here(desc, key_jump_cmd);
 
-	/* load IV */
-	append_seq_load(desc, ivsize, LDST_SRCDST_BYTE_CONTEXT |
-			LDST_CLASS_1_CCB | (ctx1_iv_off << LDST_OFFSET_SHIFT));
+	/* Load IV, if there is one */
+	if (ivsize)
+		append_seq_load(desc, ivsize, LDST_SRCDST_BYTE_CONTEXT |
+				LDST_CLASS_1_CCB | (ctx1_iv_off <<
+				LDST_OFFSET_SHIFT));
 
 	/* Load counter into CONTEXT1 reg */
 	if (is_rfc3686)
@@ -1383,6 +1390,7 @@ void cnstr_shdsc_ablkcipher_givencap(u32 * const desc, struct alginfo *cdata,
 				     const u32 ctx1_iv_off)
 {
 	u32 *key_jump_cmd, geniv;
+	u32 key_option;
 
 	init_sh_desc(desc, HDR_SHARE_SERIAL | HDR_SAVECTX);
 	/* Skip if already shared */
@@ -1390,8 +1398,13 @@ void cnstr_shdsc_ablkcipher_givencap(u32 * const desc, struct alginfo *cdata,
 				   JUMP_COND_SHRD);
 
 	/* Load class1 key only */
-	append_key_as_imm(desc, cdata->key_virt, cdata->keylen,
-			  cdata->keylen, CLASS_1 | KEY_DEST_CLASS_REG);
+	key_option = CLASS_1 | KEY_DEST_CLASS_REG | cdata->key_cmd_opt;
+	if (cdata->key_inline)
+		append_key_as_imm(desc, cdata->key_virt, cdata->keylen,
+				  cdata->key_real_len, key_option);
+	else
+		append_key(desc, cdata->key_dma, cdata->key_real_len,
+			   key_option);
 
 	/* Load Nonce into CONTEXT1 reg */
 	if (is_rfc3686) {
@@ -1457,13 +1470,7 @@ EXPORT_SYMBOL(cnstr_shdsc_ablkcipher_givencap);
  */
 void cnstr_shdsc_xts_ablkcipher_encap(u32 * const desc, struct alginfo *cdata)
 {
-	/*
-	 * Set sector size to a big value, practically disabling
-	 * sector size segmentation in xts implementation. We cannot
-	 * take full advantage of this HW feature with existing
-	 * crypto API / dm-crypt SW architecture.
-	 */
-	__be64 sector_size = cpu_to_be64(BIT(15));
+	__be64 sector_size = cpu_to_be64(512);
 	u32 *key_jump_cmd;
 
 	init_sh_desc(desc, HDR_SHARE_SERIAL | HDR_SAVECTX);
@@ -1515,13 +1522,7 @@ EXPORT_SYMBOL(cnstr_shdsc_xts_ablkcipher_encap);
  */
 void cnstr_shdsc_xts_ablkcipher_decap(u32 * const desc, struct alginfo *cdata)
 {
-	/*
-	 * Set sector size to a big value, practically disabling
-	 * sector size segmentation in xts implementation. We cannot
-	 * take full advantage of this HW feature with existing
-	 * crypto API / dm-crypt SW architecture.
-	 */
-	__be64 sector_size = cpu_to_be64(BIT(15));
+	__be64 sector_size = cpu_to_be64(512);
 	u32 *key_jump_cmd;
 
 	init_sh_desc(desc, HDR_SHARE_SERIAL | HDR_SAVECTX);

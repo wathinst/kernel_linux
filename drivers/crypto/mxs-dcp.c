@@ -20,12 +20,12 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/stmp_device.h>
+#include <linux/clk.h>
 
 #include <crypto/aes.h>
 #include <crypto/sha.h>
 #include <crypto/internal/hash.h>
 #include <crypto/internal/skcipher.h>
-#include <crypto/scatterwalk.h>
 
 #define DCP_MAX_CHANS	4
 #define DCP_BUF_SZ	PAGE_SIZE
@@ -33,15 +33,16 @@
 
 #define DCP_ALIGNMENT	64
 
+
 /*
  * Null hashes to align with hw behavior on imx6sl and ull
  * these are flipped for consistency with hw output
  */
-static const uint8_t sha1_null_hash[] =
+const uint8_t sha1_null_hash[] =
 	"\x09\x07\xd8\xaf\x90\x18\x60\x95\xef\xbf"
 	"\x55\x32\x0d\x4b\x6b\x5e\xee\xa3\x39\xda";
 
-static const uint8_t sha256_null_hash[] =
+const uint8_t sha256_null_hash[] =
 	"\x55\xb8\x52\x78\x1b\x99\x95\xa4"
 	"\x4c\x93\x9b\x64\xe4\x41\xae\x27"
 	"\x24\xb9\x6f\x99\xc8\xf4\xfb\x9a"
@@ -83,6 +84,10 @@ struct dcp {
 	spinlock_t			lock[DCP_MAX_CHANS];
 	struct task_struct		*thread[DCP_MAX_CHANS];
 	struct crypto_queue		queue[DCP_MAX_CHANS];
+#ifdef CONFIG_ARM
+	struct clk *dcp_clk;
+#endif
+	int                             enable_sha_workaround;
 };
 
 enum dcp_chan {
@@ -114,6 +119,11 @@ struct dcp_aes_req_ctx {
 struct dcp_sha_req_ctx {
 	unsigned int	init:1;
 	unsigned int	fini:1;
+};
+
+struct dcp_export_state {
+	struct dcp_sha_req_ctx req_ctx;
+	struct dcp_async_ctx async_ctx;
 };
 
 /*
@@ -299,6 +309,12 @@ static int mxs_dcp_aes_block_crypt(struct crypto_async_request *arq)
 	bool limit_hit = false;
 
 	actx->fill = 0;
+
+	/*
+	 * We are not supporting the case where there is no message to encrypt
+	 */
+	if (nents == 0)
+		return -EINVAL;
 
 	/* Copy the key from the temporary location. */
 	memcpy(key, actx->key, actx->key_len);
@@ -583,7 +599,8 @@ static int mxs_dcp_run_sha(struct ahash_request *req)
 	/*
 	 * Align driver with hw behavior when generating null hashes
 	 */
-	if (rctx->init && rctx->fini && desc->size == 0) {
+	if (rctx->init && rctx->fini && desc->size == 0 &&
+	    sdcp->enable_sha_workaround) {
 		struct hash_alg_common *halg = crypto_hash_alg_common(tfm);
 		const uint8_t *sha_buf =
 			(actx->alg == MXS_DCP_CONTROL1_HASH_SELECT_SHA1) ?
@@ -622,46 +639,49 @@ static int dcp_sha_req_to_buf(struct crypto_async_request *arq)
 	struct dcp_async_ctx *actx = crypto_ahash_ctx(tfm);
 	struct dcp_sha_req_ctx *rctx = ahash_request_ctx(req);
 	struct hash_alg_common *halg = crypto_hash_alg_common(tfm);
+	const int nents = sg_nents(req->src);
 
 	uint8_t *in_buf = sdcp->coh->sha_in_buf;
 	uint8_t *out_buf = sdcp->coh->sha_out_buf;
 
+	uint8_t *src_buf;
+
 	struct scatterlist *src;
 
-	unsigned int i, len, clen, oft = 0;
+	unsigned int i, len, clen;
 	int ret;
 
 	int fin = rctx->fini;
 	if (fin)
 		rctx->fini = 0;
 
-	src = req->src;
-	len = req->nbytes;
+	for_each_sg(req->src, src, nents, i) {
+		src_buf = sg_virt(src);
+		len = sg_dma_len(src);
 
-	while (len) {
-		if (actx->fill + len > DCP_BUF_SZ)
-			clen = DCP_BUF_SZ - actx->fill;
-		else
-			clen = len;
+		do {
+			if (actx->fill + len > DCP_BUF_SZ)
+				clen = DCP_BUF_SZ - actx->fill;
+			else
+				clen = len;
 
-		scatterwalk_map_and_copy(in_buf + actx->fill, src, oft, clen,
-					 0);
+			memcpy(in_buf + actx->fill, src_buf, clen);
+			len -= clen;
+			src_buf += clen;
+			actx->fill += clen;
 
-		len -= clen;
-		oft += clen;
-		actx->fill += clen;
-
-		/*
-		 * If we filled the buffer and still have some
-		 * more data, submit the buffer.
-		 */
-		if (len && actx->fill == DCP_BUF_SZ) {
-			ret = mxs_dcp_run_sha(req);
-			if (ret)
-				return ret;
-			actx->fill = 0;
-			rctx->init = 0;
-		}
+			/*
+			 * If we filled the buffer and still have some
+			 * more data, submit the buffer.
+			 */
+			if (len && actx->fill == DCP_BUF_SZ) {
+				ret = mxs_dcp_run_sha(req);
+				if (ret)
+					return ret;
+				actx->fill = 0;
+				rctx->init = 0;
+			}
+		} while (len);
 	}
 
 	if (fin) {
@@ -809,6 +829,35 @@ static int dcp_sha_finup(struct ahash_request *req)
 	return dcp_sha_update_fx(req, 1);
 }
 
+static int dcp_sha_export(struct ahash_request *req, void *out)
+{
+	struct dcp_sha_req_ctx *rctx_state = ahash_request_ctx(req);
+	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
+	struct dcp_async_ctx *actx_state = crypto_ahash_ctx(tfm);
+	struct dcp_export_state *export = out;
+
+	memcpy(&export->req_ctx, rctx_state, sizeof(struct dcp_sha_req_ctx));
+	memcpy(&export->async_ctx, actx_state, sizeof(struct dcp_async_ctx));
+
+	return 0;
+}
+
+static int dcp_sha_import(struct ahash_request *req, const void *in)
+{
+	struct dcp_sha_req_ctx *rctx = ahash_request_ctx(req);
+	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
+	struct dcp_async_ctx *actx = crypto_ahash_ctx(tfm);
+	const struct dcp_export_state *export = in;
+
+	memset(rctx, 0, sizeof(struct dcp_sha_req_ctx));
+	memset(actx, 0, sizeof(struct dcp_async_ctx));
+
+	memcpy(rctx, &export->req_ctx, sizeof(struct dcp_sha_req_ctx));
+	memcpy(actx, &export->async_ctx, sizeof(struct dcp_async_ctx));
+
+	return 0;
+}
+
 static int dcp_sha_digest(struct ahash_request *req)
 {
 	int ret;
@@ -818,16 +867,6 @@ static int dcp_sha_digest(struct ahash_request *req)
 		return ret;
 
 	return dcp_sha_finup(req);
-}
-
-static int dcp_sha_noimport(struct ahash_request *req, const void *in)
-{
-	return -ENOSYS;
-}
-
-static int dcp_sha_noexport(struct ahash_request *req, void *out)
-{
-	return -ENOSYS;
 }
 
 static int dcp_sha_cra_init(struct crypto_tfm *tfm)
@@ -900,10 +939,11 @@ static struct ahash_alg dcp_sha1_alg = {
 	.final	= dcp_sha_final,
 	.finup	= dcp_sha_finup,
 	.digest	= dcp_sha_digest,
-	.import = dcp_sha_noimport,
-	.export = dcp_sha_noexport,
+	.export = dcp_sha_export,
+	.import = dcp_sha_import,
 	.halg	= {
 		.digestsize	= SHA1_DIGEST_SIZE,
+		.statesize	= sizeof(struct dcp_export_state),
 		.base		= {
 			.cra_name		= "sha1",
 			.cra_driver_name	= "sha1-dcp",
@@ -926,10 +966,11 @@ static struct ahash_alg dcp_sha256_alg = {
 	.final	= dcp_sha_final,
 	.finup	= dcp_sha_finup,
 	.digest	= dcp_sha_digest,
-	.import = dcp_sha_noimport,
-	.export = dcp_sha_noexport,
+	.export = dcp_sha_export,
+	.import = dcp_sha_import,
 	.halg	= {
 		.digestsize	= SHA256_DIGEST_SIZE,
+		.statesize	= sizeof(struct dcp_export_state),
 		.base		= {
 			.cra_name		= "sha256",
 			.cra_driver_name	= "sha256-dcp",
@@ -1003,6 +1044,26 @@ static int mxs_dcp_probe(struct platform_device *pdev)
 	if (IS_ERR(sdcp->base))
 		return PTR_ERR(sdcp->base);
 
+#ifdef CONFIG_ARM
+	sdcp->dcp_clk = devm_clk_get(dev, "dcp");
+
+	if (IS_ERR(sdcp->dcp_clk)) {
+		ret = PTR_ERR(sdcp->dcp_clk);
+		dev_err(dev, "can't identify DCP clk: %d\n", ret);
+		return -ENODEV;
+	}
+
+	ret = clk_prepare(sdcp->dcp_clk);
+	if (ret < 0) {
+		dev_err(&pdev->dev, "can't prepare DCP clock: %d\n", ret);
+		return -ENODEV;
+	}
+	ret = clk_enable(sdcp->dcp_clk);
+	if (ret < 0) {
+		dev_err(&pdev->dev, "can't enable DCP clock: %d\n", ret);
+		return -ENODEV;
+	}
+#endif
 
 	ret = devm_request_irq(dev, dcp_vmi_irq, mxs_dcp_irq, 0,
 			       "dcp-vmi-irq", sdcp);
@@ -1062,6 +1123,11 @@ static int mxs_dcp_probe(struct platform_device *pdev)
 		init_completion(&sdcp->completion[i]);
 		crypto_init_queue(&sdcp->queue[i], 50);
 	}
+
+	/*
+	 * Enable driver alignment with hw behavior for sha generation
+	 */
+	sdcp->enable_sha_workaround = 1;
 
 	/* Create the SHA and AES handler threads. */
 	sdcp->thread[DCP_CHAN_HASH_SHA] = kthread_run(dcp_chan_thread_sha,
@@ -1144,6 +1210,11 @@ static int mxs_dcp_remove(struct platform_device *pdev)
 	kthread_stop(sdcp->thread[DCP_CHAN_HASH_SHA]);
 	kthread_stop(sdcp->thread[DCP_CHAN_CRYPTO]);
 
+#ifdef CONFIG_ARM
+	/* shut clocks off before finalizing shutdown */
+	clk_disable(sdcp->dcp_clk);
+#endif
+
 	platform_set_drvdata(pdev, NULL);
 
 	global_sdcp = NULL;
@@ -1154,6 +1225,7 @@ static int mxs_dcp_remove(struct platform_device *pdev)
 static const struct of_device_id mxs_dcp_dt_ids[] = {
 	{ .compatible = "fsl,imx23-dcp", .data = NULL, },
 	{ .compatible = "fsl,imx28-dcp", .data = NULL, },
+	{ .compatible = "fsl,imx6sl-dcp", .data = NULL, },
 	{ /* sentinel */ }
 };
 

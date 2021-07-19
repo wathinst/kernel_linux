@@ -16,6 +16,7 @@
  */
 
 #include <linux/bitops.h>
+#include <linux/clk.h>
 #include <linux/err.h>
 #include <linux/gpio.h>
 #include <linux/init.h>
@@ -37,7 +38,6 @@ struct fsl_gpio_soc_data {
 
 struct vf610_gpio_port {
 	struct gpio_chip gc;
-	struct irq_chip ic;
 	void __iomem *base;
 	void __iomem *gpio_base;
 	const struct fsl_gpio_soc_data *sdata;
@@ -66,6 +66,8 @@ struct vf610_gpio_port {
 #define PORT_INT_FALLING_EDGE	0xa
 #define PORT_INT_EITHER_EDGE	0xb
 #define PORT_INT_LOGIC_ONE	0xc
+
+static struct irq_chip vf610_gpio_irq_chip;
 
 static const struct fsl_gpio_soc_data imx_data = {
 	.have_paddr = true,
@@ -242,14 +244,23 @@ static int vf610_gpio_irq_set_wake(struct irq_data *d, u32 enable)
 	return 0;
 }
 
+static struct irq_chip vf610_gpio_irq_chip = {
+	.name		= "gpio-vf610",
+	.irq_ack	= vf610_gpio_irq_ack,
+	.irq_mask	= vf610_gpio_irq_mask,
+	.irq_unmask	= vf610_gpio_irq_unmask,
+	.irq_set_type	= vf610_gpio_irq_set_type,
+	.irq_set_wake	= vf610_gpio_irq_set_wake,
+};
+
 static int vf610_gpio_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct device_node *np = dev->of_node;
+	struct clk *clk_port, *clk_gpio;
 	struct vf610_gpio_port *port;
 	struct resource *iores;
 	struct gpio_chip *gc;
-	struct irq_chip *ic;
 	int i;
 	int ret;
 
@@ -272,6 +283,23 @@ static int vf610_gpio_probe(struct platform_device *pdev)
 	if (port->irq < 0)
 		return port->irq;
 
+	clk_port = devm_clk_get(&pdev->dev, "port");
+	clk_gpio = devm_clk_get(&pdev->dev, "gpio");
+	if (PTR_ERR(clk_port) == -EPROBE_DEFER ||
+	    PTR_ERR(clk_gpio) == -EPROBE_DEFER)
+		return -EPROBE_DEFER;
+
+	if (!IS_ERR(clk_port) && !IS_ERR(clk_gpio)) {
+		ret = clk_prepare_enable(clk_port);
+		if (ret)
+			return ret;
+		ret = clk_prepare_enable(clk_gpio);
+		if (ret) {
+			clk_disable_unprepare(clk_port);
+			return ret;
+		}
+	}
+
 	gc = &port->gc;
 	gc->of_node = np;
 	gc->parent = dev;
@@ -286,14 +314,6 @@ static int vf610_gpio_probe(struct platform_device *pdev)
 	gc->direction_output = vf610_gpio_direction_output;
 	gc->set = vf610_gpio_set;
 
-	ic = &port->ic;
-	ic->name = "gpio-vf610";
-	ic->irq_ack = vf610_gpio_irq_ack;
-	ic->irq_mask = vf610_gpio_irq_mask;
-	ic->irq_unmask = vf610_gpio_irq_unmask;
-	ic->irq_set_type = vf610_gpio_irq_set_type;
-	ic->irq_set_wake = vf610_gpio_irq_set_wake;
-
 	ret = gpiochip_add_data(gc, port);
 	if (ret < 0)
 		return ret;
@@ -305,13 +325,22 @@ static int vf610_gpio_probe(struct platform_device *pdev)
 	/* Clear the interrupt status register for all GPIO's */
 	vf610_gpio_writel(~0, port->base + PORT_ISFR);
 
-	ret = gpiochip_irqchip_add(gc, ic, 0, handle_edge_irq, IRQ_TYPE_NONE);
+	/*
+	 * At imx7ulp, any interrupts can wake system up from "standby" mode,
+	 * so, mask interrupt at suspend mode by default, and the user
+	 * can still enable wakeup through /sys entry.
+	 */
+	if (of_machine_is_compatible("fsl,imx7ulp"))
+		vf610_gpio_irq_chip.flags = IRQCHIP_MASK_ON_SUSPEND;
+
+	ret = gpiochip_irqchip_add(gc, &vf610_gpio_irq_chip, 0,
+				   handle_edge_irq, IRQ_TYPE_NONE);
 	if (ret) {
 		dev_err(dev, "failed to add irqchip\n");
 		gpiochip_remove(gc);
 		return ret;
 	}
-	gpiochip_set_chained_irqchip(gc, ic, port->irq,
+	gpiochip_set_chained_irqchip(gc, &vf610_gpio_irq_chip, port->irq,
 				     vf610_gpio_irq_handler);
 
 	return 0;

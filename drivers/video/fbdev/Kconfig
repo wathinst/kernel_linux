@@ -2,23 +2,11 @@
 # fbdev configuration
 #
 
-config FB_CMDLINE
-	bool
-
-config FB_NOTIFY
-	bool
-
-config FB_CLPS711X_OLD
-	tristate
-	select FB_CFB_FILLRECT
-	select FB_CFB_COPYAREA
-	select FB_CFB_IMAGEBLIT
-
 menuconfig FB
 	tristate "Support for frame buffer devices"
 	select FB_CMDLINE
 	select FB_NOTIFY
-	---help---
+	help
 	  The frame buffer device provides an abstraction for the graphics
 	  hardware. It represents the frame buffer of some video hardware and
 	  allows application software to access the graphics hardware through
@@ -50,11 +38,28 @@ menuconfig FB
 	  (e.g. an accelerated X server) and that are not frame buffer
 	  device-aware may cause unexpected results. If unsure, say N.
 
+config FB_IMX64
+	bool "Enable framebuffer support for 64 bit platforms"
+	depends on FB && ARM64
+	default n
+	help
+	  Add framebuffer device support for 64 bit platforms. This is needed
+	  only if you specifically need FBDEV support on your 64bit platform,
+	  since it will soon become deprecated.
+
+config FB_IMX64_DEBUG
+	bool "Enable debug messages and operations for 64bit framebuffer devices"
+	depends on FB_IMX64
+	default n
+	help
+	  Select this option if you need to debug 64bit platforms specific
+	  operations.
+
 config FIRMWARE_EDID
        bool "Enable firmware EDID"
        depends on FB
        default n
-       ---help---
+       help
          This enables access to the EDID transferred from the firmware.
 	 On the i386, this is from the Video BIOS. Enable this if DDC/I2C
 	 transfers do not work for your driver and if you are using
@@ -65,6 +70,12 @@ config FIRMWARE_EDID
 	 something on your display, try setting this to N.  Matrox cards in
 	 combination with certain motherboards and monitors are known to
 	 suffer from this problem.
+
+config FB_CMDLINE
+	bool
+
+config FB_NOTIFY
+	bool
 
 config FB_DDC
        tristate
@@ -334,6 +345,12 @@ config FB_ACORN
 	  This is the frame buffer device driver for the Acorn VIDC graphics
 	  hardware found in Acorn RISC PCs and other ARM-based machines.  If
 	  unsure, say N.
+
+config FB_CLPS711X_OLD
+	tristate
+	select FB_CFB_FILLRECT
+	select FB_CFB_COPYAREA
+	select FB_CFB_IMAGEBLIT
 
 config FB_CLPS711X
 	tristate "CLPS711X LCD support"
@@ -1456,6 +1473,7 @@ if FB_VIA
 
 config FB_VIA_DIRECT_PROCFS
 	bool "direct hardware access via procfs (DEPRECATED)(DANGEROUS)"
+	depends on FB_VIA
 	default n
 	help
 	  Allow direct hardware access to some output registers via procfs.
@@ -1465,6 +1483,7 @@ config FB_VIA_DIRECT_PROCFS
 
 config FB_VIA_X_COMPATIBILITY
 	bool "X server compatibility"
+	depends on FB_VIA
 	default n
 	help
 	  This option reduces the functionality (power saving, ...) of the
@@ -2261,7 +2280,9 @@ config FB_JZ4740
 
 config FB_MXS
 	tristate "MXS LCD framebuffer support"
-	depends on FB && (ARCH_MXS || ARCH_MXC)
+	depends on (FB && (ARCH_MXS || ARCH_MXC)) || \
+		   (FB_IMX64 && (ARCH_FSL_IMX8QM || ARCH_FSL_IMX8QXP || ARCH_FSL_IMX8MQ))
+	select FB_MXC_DISP_FRAMEWORK
 	select FB_CFB_FILLRECT
 	select FB_CFB_COPYAREA
 	select FB_CFB_IMAGEBLIT
@@ -2306,6 +2327,27 @@ config FB_SIMPLE
 	  Configuration re: surface address, size, and format must be provided
 	  through device tree, or plain old platform data.
 
+source "drivers/video/fbdev/omap/Kconfig"
+source "drivers/video/fbdev/omap2/Kconfig"
+source "drivers/video/fbdev/mmp/Kconfig"
+
+if ARCH_MXC || \
+	(FB_IMX64 && (ARCH_FSL_IMX8QM || ARCH_FSL_IMX8QXP || ARCH_FSL_IMX8MQ))
+source "drivers/video/fbdev/mxc/Kconfig"
+endif
+
+config FB_SH_MOBILE_MERAM
+	tristate "SuperH Mobile MERAM read ahead support"
+	depends on (SUPERH || ARCH_SHMOBILE)
+	select GENERIC_ALLOCATOR
+	help
+	  Enable MERAM support for the SuperH controller.
+
+	  This will allow for caching of the framebuffer to provide more
+	  reliable access under heavy main memory bus traffic situations.
+	  Up to 4 memory channels can be configured, allowing 4 RGB or
+	  2 YCbCr framebuffers to be configured.
+
 config FB_SSD1307
 	tristate "Solomon SSD1307 framebuffer support"
 	depends on FB && I2C
@@ -2335,7 +2377,3 @@ config FB_SM712
 	  This driver is also available as a module. The module will be
 	  called sm712fb. If you want to compile it as a module, say M
 	  here and read <file:Documentation/kbuild/modules.txt>.
-
-source "drivers/video/fbdev/omap/Kconfig"
-source "drivers/video/fbdev/omap2/Kconfig"
-source "drivers/video/fbdev/mmp/Kconfig"

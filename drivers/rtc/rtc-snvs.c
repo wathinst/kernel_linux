@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0+
 //
-// Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
+// Copyright (C) 2011-2016 Freescale Semiconductor, Inc.
 
 #include <linux/init.h>
 #include <linux/io.h>
@@ -66,7 +66,13 @@ static u32 rtc_read_lp_counter(struct snvs_rtc_data *data)
 	do {
 		read2 = read1;
 		read1 = rtc_read_lpsrt(data);
-	} while (read1 != read2 && --timeout);
+	/*
+	 * when CPU/BUS are running at low speed, there is chance that
+	 * we never get same value during two consecutive read, so here
+	 * we only compare the second value.
+	 */
+	} while ((read1 >> CNTR_TO_SECS_SH) != (read2 >> CNTR_TO_SECS_SH) &&
+		 --timeout);
 	if (!timeout)
 		dev_err(&data->rtc->dev, "Timeout trying to get valid LPSRT Counter read\n");
 
@@ -273,10 +279,6 @@ static int snvs_rtc_probe(struct platform_device *pdev)
 	if (!data)
 		return -ENOMEM;
 
-	data->rtc = devm_rtc_allocate_device(&pdev->dev);
-	if (IS_ERR(data->rtc))
-		return PTR_ERR(data->rtc);
-
 	data->regmap = syscon_regmap_lookup_by_phandle(pdev->dev.of_node, "regmap");
 
 	if (IS_ERR(data->regmap)) {
@@ -339,9 +341,10 @@ static int snvs_rtc_probe(struct platform_device *pdev)
 		goto error_rtc_device_register;
 	}
 
-	data->rtc->ops = &snvs_rtc_ops;
-	ret = rtc_register_device(data->rtc);
-	if (ret) {
+	data->rtc = devm_rtc_device_register(&pdev->dev, pdev->name,
+					&snvs_rtc_ops, THIS_MODULE);
+	if (IS_ERR(data->rtc)) {
+		ret = PTR_ERR(data->rtc);
 		dev_err(&pdev->dev, "failed to register rtc: %d\n", ret);
 		goto error_rtc_device_register;
 	}

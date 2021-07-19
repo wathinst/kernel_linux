@@ -55,6 +55,8 @@
 
 static const unsigned freqs[] = { 400000, 300000, 200000, 100000 };
 
+static int __mmc_max_reserved_idx = -1;
+
 /*
  * Enabling software CRCs on the data blocks can be a significant (30%)
  * performance cost, and for other reasons may not always be desired.
@@ -144,9 +146,8 @@ void mmc_request_done(struct mmc_host *host, struct mmc_request *mrq)
 	int err = cmd->error;
 
 	/* Flag re-tuning needed on CRC errors */
-	if (cmd->opcode != MMC_SEND_TUNING_BLOCK &&
-	    cmd->opcode != MMC_SEND_TUNING_BLOCK_HS200 &&
-	    !host->retune_crc_disable &&
+	if ((cmd->opcode != MMC_SEND_TUNING_BLOCK &&
+	    cmd->opcode != MMC_SEND_TUNING_BLOCK_HS200) &&
 	    (err == -EILSEQ || (mrq->sbc && mrq->sbc->error == -EILSEQ) ||
 	    (mrq->data && mrq->data->error == -EILSEQ) ||
 	    (mrq->stop && mrq->stop->error == -EILSEQ)))
@@ -2043,11 +2044,8 @@ static int mmc_do_erase(struct mmc_card *card, unsigned int from,
 	 * the erase operation does not exceed the max_busy_timeout, we should
 	 * use R1B response. Or we need to prevent the host from doing hw busy
 	 * detection, which is done by converting to a R1 response instead.
-	 * Note, some hosts requires R1B, which also means they are on their own
-	 * when it comes to deal with the busy timeout.
 	 */
-	if (!(card->host->caps & MMC_CAP_NEED_RSP_BUSY) &&
-	    card->host->max_busy_timeout &&
+	if (card->host->max_busy_timeout &&
 	    busy_timeout > card->host->max_busy_timeout) {
 		cmd.flags = MMC_RSP_SPI_R1 | MMC_RSP_R1 | MMC_CMD_AC;
 	} else {
@@ -2686,7 +2684,8 @@ void mmc_start_host(struct mmc_host *host)
 	}
 
 	mmc_gpiod_request_cd_irq(host);
-	_mmc_detect_change(host, 0, false);
+	if (!(host->caps2 & MMC_CAP2_CD_POST))
+		_mmc_detect_change(host, 0, false);
 }
 
 void mmc_stop_host(struct mmc_host *host)
@@ -2794,9 +2793,45 @@ void mmc_unregister_pm_notifier(struct mmc_host *host)
 }
 #endif
 
+/*
+ * mmc_first_nonreserved_index() - get the first index that
+ * is not reserved
+ */
+int mmc_first_nonreserved_index(void)
+{
+	return __mmc_max_reserved_idx + 1;
+}
+EXPORT_SYMBOL(mmc_first_nonreserved_index);
+
+/*
+ * mmc_get_reserved_index() - get the index reserved for this host
+ * Return: The index reserved for this host or negative error value
+ *         if no index is reserved for this host
+ */
+int mmc_get_reserved_index(struct mmc_host *host)
+{
+	return of_alias_get_id(host->parent->of_node, "mmc");
+}
+EXPORT_SYMBOL(mmc_get_reserved_index);
+
+static void mmc_of_reserve_idx(void)
+{
+	int max;
+
+	max = of_alias_max_index("mmc");
+	if (max < 0)
+		return;
+
+	__mmc_max_reserved_idx = max;
+	pr_debug("MMC: reserving %d slots for of aliases\n",
+			__mmc_max_reserved_idx + 1);
+}
+
 static int __init mmc_init(void)
 {
 	int ret;
+
+	mmc_of_reserve_idx();
 
 	ret = mmc_register_bus();
 	if (ret)
