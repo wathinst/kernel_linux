@@ -1730,27 +1730,25 @@ BPF_CALL_5(bpf_skb_load_bytes_relative, const struct sk_buff *, skb,
 	   u32, offset, void *, to, u32, len, u32, start_header)
 {
 	u8 *end = skb_tail_pointer(skb);
-	u8 *start, *ptr;
+	u8 *net = skb_network_header(skb);
+	u8 *mac = skb_mac_header(skb);
+	u8 *ptr;
 
-	if (unlikely(offset > 0xffff))
+	if (unlikely(offset > 0xffff || len > (end - mac)))
 		goto err_clear;
 
 	switch (start_header) {
 	case BPF_HDR_START_MAC:
-		if (unlikely(!skb_mac_header_was_set(skb)))
-			goto err_clear;
-		start = skb_mac_header(skb);
+		ptr = mac + offset;
 		break;
 	case BPF_HDR_START_NET:
-		start = skb_network_header(skb);
+		ptr = net + offset;
 		break;
 	default:
 		goto err_clear;
 	}
 
-	ptr = start + offset;
-
-	if (likely(ptr + len <= end)) {
+	if (likely(ptr >= mac && ptr + len <= end)) {
 		memcpy(to, ptr, len);
 		return 0;
 	}
@@ -2002,18 +2000,17 @@ static inline int __bpf_tx_skb(struct net_device *dev, struct sk_buff *skb)
 {
 	int ret;
 
-	if (dev_xmit_recursion()) {
+	if (unlikely(__this_cpu_read(xmit_recursion) > XMIT_RECURSION_LIMIT)) {
 		net_crit_ratelimited("bpf: recursion limit reached on datapath, buggy bpf program?\n");
 		kfree_skb(skb);
 		return -ENETDOWN;
 	}
 
 	skb->dev = dev;
-	skb->tstamp = 0;
 
-	dev_xmit_recursion_inc();
+	__this_cpu_inc(xmit_recursion);
 	ret = dev_queue_xmit(skb);
-	dev_xmit_recursion_dec();
+	__this_cpu_dec(xmit_recursion);
 
 	return ret;
 }
@@ -2695,7 +2692,7 @@ static int bpf_skb_proto_6_to_4(struct sk_buff *skb)
 
 static int bpf_skb_proto_xlat(struct sk_buff *skb, __be16 to_proto)
 {
-	__be16 from_proto = skb_protocol(skb, true);
+	__be16 from_proto = skb->protocol;
 
 	if (from_proto == htons(ETH_P_IP) &&
 	      to_proto == htons(ETH_P_IPV6))
@@ -2768,7 +2765,7 @@ static const struct bpf_func_proto bpf_skb_change_type_proto = {
 
 static u32 bpf_skb_net_base_len(const struct sk_buff *skb)
 {
-	switch (skb_protocol(skb, true)) {
+	switch (skb->protocol) {
 	case htons(ETH_P_IP):
 		return sizeof(struct iphdr);
 	case htons(ETH_P_IPV6):
@@ -2848,7 +2845,7 @@ static int bpf_skb_adjust_net(struct sk_buff *skb, s32 len_diff)
 	u32 len_cur, len_diff_abs = abs(len_diff);
 	u32 len_min = bpf_skb_net_base_len(skb);
 	u32 len_max = __bpf_skb_max_len(skb);
-	__be16 proto = skb_protocol(skb, true);
+	__be16 proto = skb->protocol;
 	bool shrink = len_diff < 0;
 	int ret;
 
@@ -3209,7 +3206,7 @@ static int __bpf_tx_xdp_map(struct net_device *dev_rx, void *fwd,
 		return err;
 	}
 	default:
-		return -EBADRQC;
+		break;
 	}
 	return 0;
 }
@@ -3994,7 +3991,7 @@ BPF_CALL_5(bpf_setsockopt, struct bpf_sock_ops_kern *, bpf_sock,
 						    TCP_CA_NAME_MAX-1));
 			name[TCP_CA_NAME_MAX-1] = 0;
 			ret = tcp_set_congestion_control(sk, name, false,
-							 reinit, true);
+							 reinit);
 		} else {
 			struct tcp_sock *tp = tcp_sk(sk);
 
@@ -4369,7 +4366,7 @@ static int bpf_ipv6_fib_lookup(struct net *net, struct bpf_fib_lookup *params,
 		return -ENODEV;
 
 	idev = __in6_dev_get_safely(dev);
-	if (unlikely(!idev || !idev->cnf.forwarding))
+	if (unlikely(!idev || !net->ipv6.devconf_all->forwarding))
 		return BPF_FIB_LKUP_RET_FWD_DISABLED;
 
 	if (flags & BPF_FIB_LOOKUP_OUTPUT) {
@@ -4552,7 +4549,7 @@ static int bpf_push_seg6_encap(struct sk_buff *skb, u32 type, void *hdr, u32 len
 
 	switch (type) {
 	case BPF_LWT_ENCAP_SEG6_INLINE:
-		if (skb_protocol(skb, true) != htons(ETH_P_IPV6))
+		if (skb->protocol != htons(ETH_P_IPV6))
 			return -EBADMSG;
 
 		err = seg6_do_srh_inline(skb, srh);
@@ -5418,6 +5415,8 @@ static int bpf_gen_ld_abs(const struct bpf_insn *orig,
 	bool indirect = BPF_MODE(orig->code) == BPF_IND;
 	struct bpf_insn *insn = insn_buf;
 
+	/* We're guaranteed here that CTX is in R6. */
+	*insn++ = BPF_MOV64_REG(BPF_REG_1, BPF_REG_CTX);
 	if (!indirect) {
 		*insn++ = BPF_MOV64_IMM(BPF_REG_2, orig->imm);
 	} else {
@@ -5425,8 +5424,6 @@ static int bpf_gen_ld_abs(const struct bpf_insn *orig,
 		if (orig->imm)
 			*insn++ = BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, orig->imm);
 	}
-	/* We're guaranteed here that CTX is in R6. */
-	*insn++ = BPF_MOV64_REG(BPF_REG_1, BPF_REG_CTX);
 
 	switch (BPF_SIZE(orig->code)) {
 	case BPF_B:
@@ -5561,7 +5558,6 @@ static bool sock_addr_is_valid_access(int off, int size,
 		case BPF_CGROUP_INET4_BIND:
 		case BPF_CGROUP_INET4_CONNECT:
 		case BPF_CGROUP_UDP4_SENDMSG:
-		case BPF_CGROUP_UDP4_RECVMSG:
 			break;
 		default:
 			return false;
@@ -5572,7 +5568,6 @@ static bool sock_addr_is_valid_access(int off, int size,
 		case BPF_CGROUP_INET6_BIND:
 		case BPF_CGROUP_INET6_CONNECT:
 		case BPF_CGROUP_UDP6_SENDMSG:
-		case BPF_CGROUP_UDP6_RECVMSG:
 			break;
 		default:
 			return false;
@@ -7237,13 +7232,13 @@ sk_reuseport_is_valid_access(int off, int size,
 		return size == size_default;
 
 	/* Fields that allow narrowing */
-	case bpf_ctx_range(struct sk_reuseport_md, eth_protocol):
+	case offsetof(struct sk_reuseport_md, eth_protocol):
 		if (size < FIELD_SIZEOF(struct sk_buff, protocol))
 			return false;
 		/* fall through */
-	case bpf_ctx_range(struct sk_reuseport_md, ip_protocol):
-	case bpf_ctx_range(struct sk_reuseport_md, bind_inany):
-	case bpf_ctx_range(struct sk_reuseport_md, len):
+	case offsetof(struct sk_reuseport_md, ip_protocol):
+	case offsetof(struct sk_reuseport_md, bind_inany):
+	case offsetof(struct sk_reuseport_md, len):
 		bpf_ctx_record_field_size(info, size_default);
 		return bpf_ctx_narrow_access_ok(off, size, size_default);
 

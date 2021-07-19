@@ -414,9 +414,6 @@ static void l2cap_chan_timeout(struct work_struct *work)
 	BT_DBG("chan %p state %s", chan, state_to_string(chan->state));
 
 	mutex_lock(&conn->chan_lock);
-	/* __set_chan_timer() calls l2cap_chan_hold(chan) while scheduling
-	 * this work. No need to call l2cap_chan_hold(chan) here again.
-	 */
 	l2cap_chan_lock(chan);
 
 	if (chan->state == BT_CONNECTED || chan->state == BT_CONFIG)
@@ -429,12 +426,12 @@ static void l2cap_chan_timeout(struct work_struct *work)
 
 	l2cap_chan_close(chan, reason);
 
-	chan->ops->close(chan);
-
 	l2cap_chan_unlock(chan);
-	l2cap_chan_put(chan);
 
+	chan->ops->close(chan);
 	mutex_unlock(&conn->chan_lock);
+
+	l2cap_chan_put(chan);
 }
 
 struct l2cap_chan *l2cap_chan_create(void)
@@ -1343,21 +1340,6 @@ static void l2cap_request_info(struct l2cap_conn *conn)
 		       sizeof(req), &req);
 }
 
-static bool l2cap_check_enc_key_size(struct hci_conn *hcon)
-{
-	/* The minimum encryption key size needs to be enforced by the
-	 * host stack before establishing any L2CAP connections. The
-	 * specification in theory allows a minimum of 1, but to align
-	 * BR/EDR and LE transports, a minimum of 7 is chosen.
-	 *
-	 * This check might also be called for unencrypted connections
-	 * that have no key size requirements. Ensure that the link is
-	 * actually encrypted before enforcing a key size.
-	 */
-	return (!test_bit(HCI_CONN_ENCRYPT, &hcon->flags) ||
-		hcon->enc_key_size >= HCI_MIN_ENC_KEY_SIZE);
-}
-
 static void l2cap_do_start(struct l2cap_chan *chan)
 {
 	struct l2cap_conn *conn = chan->conn;
@@ -1375,14 +1357,9 @@ static void l2cap_do_start(struct l2cap_chan *chan)
 	if (!(conn->info_state & L2CAP_INFO_FEAT_MASK_REQ_DONE))
 		return;
 
-	if (!l2cap_chan_check_security(chan, true) ||
-	    !__l2cap_no_conn_pending(chan))
-		return;
-
-	if (l2cap_check_enc_key_size(conn->hcon))
+	if (l2cap_chan_check_security(chan, true) &&
+	    __l2cap_no_conn_pending(chan))
 		l2cap_start_connection(chan);
-	else
-		__set_chan_timer(chan, L2CAP_DISC_TIMEOUT);
 }
 
 static inline int l2cap_mode_supported(__u8 mode, __u32 feat_mask)
@@ -1461,10 +1438,7 @@ static void l2cap_conn_start(struct l2cap_conn *conn)
 				continue;
 			}
 
-			if (l2cap_check_enc_key_size(conn->hcon))
-				l2cap_start_connection(chan);
-			else
-				l2cap_chan_close(chan, ECONNREFUSED);
+			l2cap_start_connection(chan);
 
 		} else if (chan->state == BT_CONNECT2) {
 			struct l2cap_conn_rsp rsp;
@@ -1728,9 +1702,9 @@ static void l2cap_conn_del(struct hci_conn *hcon, int err)
 
 		l2cap_chan_del(chan, err);
 
-		chan->ops->close(chan);
-
 		l2cap_chan_unlock(chan);
+
+		chan->ops->close(chan);
 		l2cap_chan_put(chan);
 	}
 
@@ -4117,8 +4091,7 @@ static inline int l2cap_config_req(struct l2cap_conn *conn,
 		return 0;
 	}
 
-	if (chan->state != BT_CONFIG && chan->state != BT_CONNECT2 &&
-	    chan->state != BT_CONNECTED) {
+	if (chan->state != BT_CONFIG && chan->state != BT_CONNECT2) {
 		cmd_reject_invalid_cid(conn, cmd->ident, chan->scid,
 				       chan->dcid);
 		goto unlock;
@@ -4341,7 +4314,6 @@ static inline int l2cap_disconnect_req(struct l2cap_conn *conn,
 		return 0;
 	}
 
-	l2cap_chan_hold(chan);
 	l2cap_chan_lock(chan);
 
 	rsp.dcid = cpu_to_le16(chan->scid);
@@ -4350,11 +4322,12 @@ static inline int l2cap_disconnect_req(struct l2cap_conn *conn,
 
 	chan->ops->set_shutdown(chan);
 
+	l2cap_chan_hold(chan);
 	l2cap_chan_del(chan, ECONNRESET);
 
-	chan->ops->close(chan);
-
 	l2cap_chan_unlock(chan);
+
+	chan->ops->close(chan);
 	l2cap_chan_put(chan);
 
 	mutex_unlock(&conn->chan_lock);
@@ -4386,21 +4359,14 @@ static inline int l2cap_disconnect_rsp(struct l2cap_conn *conn,
 		return 0;
 	}
 
-	l2cap_chan_hold(chan);
 	l2cap_chan_lock(chan);
 
-	if (chan->state != BT_DISCONN) {
-		l2cap_chan_unlock(chan);
-		l2cap_chan_put(chan);
-		mutex_unlock(&conn->chan_lock);
-		return 0;
-	}
-
+	l2cap_chan_hold(chan);
 	l2cap_chan_del(chan, 0);
 
-	chan->ops->close(chan);
-
 	l2cap_chan_unlock(chan);
+
+	chan->ops->close(chan);
 	l2cap_chan_put(chan);
 
 	mutex_unlock(&conn->chan_lock);
@@ -4923,8 +4889,10 @@ void __l2cap_physical_cfm(struct l2cap_chan *chan, int result)
 	BT_DBG("chan %p, result %d, local_amp_id %d, remote_amp_id %d",
 	       chan, result, local_amp_id, remote_amp_id);
 
-	if (chan->state == BT_DISCONN || chan->state == BT_CLOSED)
+	if (chan->state == BT_DISCONN || chan->state == BT_CLOSED) {
+		l2cap_chan_unlock(chan);
 		return;
+	}
 
 	if (chan->state != BT_CONNECTED) {
 		l2cap_do_create(chan, result, local_amp_id, remote_amp_id);
@@ -6683,10 +6651,9 @@ static int l2cap_data_rcv(struct l2cap_chan *chan, struct sk_buff *skb)
 		goto drop;
 	}
 
-	if (chan->ops->filter) {
-		if (chan->ops->filter(chan, skb))
-			goto drop;
-	}
+	if ((chan->mode == L2CAP_MODE_ERTM ||
+	     chan->mode == L2CAP_MODE_STREAMING) && sk_filter(chan->data, skb))
+		goto drop;
 
 	if (!control->sframe) {
 		int err;
@@ -6822,16 +6789,6 @@ static int l2cap_le_data_rcv(struct l2cap_chan *chan, struct sk_buff *skb)
 		chan->sdu = skb;
 		chan->sdu_len = sdu_len;
 		chan->sdu_last_frag = skb;
-
-		/* Detect if remote is not able to use the selected MPS */
-		if (skb->len + L2CAP_SDULEN_SIZE < chan->mps) {
-			u16 mps_len = skb->len + L2CAP_SDULEN_SIZE;
-
-			/* Adjust the number of credits */
-			BT_DBG("chan->mps %u -> %u", chan->mps, mps_len);
-			chan->mps = mps_len;
-			l2cap_chan_le_send_credits(chan);
-		}
 
 		return 0;
 	}
@@ -7498,7 +7455,7 @@ static void l2cap_security_cfm(struct hci_conn *hcon, u8 status, u8 encrypt)
 		}
 
 		if (chan->state == BT_CONNECT) {
-			if (!status && l2cap_check_enc_key_size(hcon))
+			if (!status)
 				l2cap_start_connection(chan);
 			else
 				__set_chan_timer(chan, L2CAP_DISC_TIMEOUT);
@@ -7507,7 +7464,7 @@ static void l2cap_security_cfm(struct hci_conn *hcon, u8 status, u8 encrypt)
 			struct l2cap_conn_rsp rsp;
 			__u16 res, stat;
 
-			if (!status && l2cap_check_enc_key_size(hcon)) {
+			if (!status) {
 				if (test_bit(FLAG_DEFER_SETUP, &chan->flags)) {
 					res = L2CAP_CR_PEND;
 					stat = L2CAP_CS_AUTHOR_PEND;

@@ -137,10 +137,6 @@ static int tunnel_key_copy_opts(const struct nlattr *nla, u8 *dst,
 			if (opt_len < 0)
 				return opt_len;
 			opts_len += opt_len;
-			if (opts_len > IP_TUNNEL_OPTS_MAX) {
-				NL_SET_ERR_MSG(extack, "Tunnel options exceeds max size");
-				return -EINVAL;
-			}
 			if (dst) {
 				dst_len -= opt_len;
 				dst += opt_len;
@@ -228,7 +224,6 @@ static int tunnel_key_init(struct net *net, struct nlattr *nla,
 	__be16 flags;
 	u8 tos, ttl;
 	int ret = 0;
-	u32 index;
 	int err;
 
 	if (!nla) {
@@ -249,8 +244,7 @@ static int tunnel_key_init(struct net *net, struct nlattr *nla,
 	}
 
 	parm = nla_data(tb[TCA_TUNNEL_KEY_PARMS]);
-	index = parm->index;
-	err = tcf_idr_check_alloc(tn, &index, a, bind);
+	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
 	if (err < 0)
 		return err;
 	exists = err;
@@ -314,7 +308,7 @@ static int tunnel_key_init(struct net *net, struct nlattr *nla,
 
 			metadata = __ipv6_tun_set_dst(&saddr, &daddr, tos, ttl, dst_port,
 						      0, flags,
-						      key_id, opts_len);
+						      key_id, 0);
 		} else {
 			NL_SET_ERR_MSG(extack, "Missing either ipv4 or ipv6 src and dst");
 			ret = -EINVAL;
@@ -344,7 +338,7 @@ static int tunnel_key_init(struct net *net, struct nlattr *nla,
 	}
 
 	if (!exists) {
-		ret = tcf_idr_create(tn, index, est, a,
+		ret = tcf_idr_create(tn, parm->index, est, a,
 				     &act_tunnel_key_ops, bind, true);
 		if (ret) {
 			NL_SET_ERR_MSG(extack, "Cannot create TC IDR");
@@ -390,7 +384,7 @@ err_out:
 	if (exists)
 		tcf_idr_release(*a, bind);
 	else
-		tcf_idr_cleanup(tn, index);
+		tcf_idr_cleanup(tn, parm->index);
 	return ret;
 }
 
@@ -583,7 +577,7 @@ static __net_init int tunnel_key_init_net(struct net *net)
 {
 	struct tc_action_net *tn = net_generic(net, tunnel_key_net_id);
 
-	return tc_action_net_init(net, tn, &act_tunnel_key_ops);
+	return tc_action_net_init(tn, &act_tunnel_key_ops);
 }
 
 static void __net_exit tunnel_key_exit_net(struct list_head *net_list)

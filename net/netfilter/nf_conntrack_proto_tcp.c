@@ -480,7 +480,6 @@ static bool tcp_in_window(const struct nf_conn *ct,
 	struct ip_ct_tcp_state *receiver = &state->seen[!dir];
 	const struct nf_conntrack_tuple *tuple = &ct->tuplehash[dir].tuple;
 	__u32 seq, ack, sack, end, win, swin;
-	u16 win_raw;
 	s32 receiver_offset;
 	bool res, in_recv_win;
 
@@ -489,8 +488,7 @@ static bool tcp_in_window(const struct nf_conn *ct,
 	 */
 	seq = ntohl(tcph->seq);
 	ack = sack = ntohl(tcph->ack_seq);
-	win_raw = ntohs(tcph->window);
-	win = win_raw;
+	win = ntohs(tcph->window);
 	end = segment_seq_plus_len(seq, skb->len, dataoff, tcph);
 
 	if (receiver->flags & IP_CT_TCP_FLAG_SACK_PERM)
@@ -549,20 +547,13 @@ static bool tcp_in_window(const struct nf_conn *ct,
 			swin = win << sender->td_scale;
 			sender->td_maxwin = (swin == 0 ? 1 : swin);
 			sender->td_maxend = end + sender->td_maxwin;
-			if (receiver->td_maxwin == 0) {
-				/* We haven't seen traffic in the other
-				 * direction yet but we have to tweak window
-				 * tracking to pass III and IV until that
-				 * happens.
-				 */
+			/*
+			 * We haven't seen traffic in the other direction yet
+			 * but we have to tweak window tracking to pass III
+			 * and IV until that happens.
+			 */
+			if (receiver->td_maxwin == 0)
 				receiver->td_end = receiver->td_maxend = sack;
-			} else if (sack == receiver->td_end + 1) {
-				/* Likely a reply to a keepalive.
-				 * Needed for III.
-				 */
-				receiver->td_end++;
-			}
-
 		}
 	} else if (((state->state == TCP_CONNTRACK_SYN_SENT
 		     && dir == IP_CT_DIR_ORIGINAL)
@@ -672,14 +663,14 @@ static bool tcp_in_window(const struct nf_conn *ct,
 			    && state->last_seq == seq
 			    && state->last_ack == ack
 			    && state->last_end == end
-			    && state->last_win == win_raw)
+			    && state->last_win == win)
 				state->retrans++;
 			else {
 				state->last_dir = dir;
 				state->last_seq = seq;
 				state->last_ack = ack;
 				state->last_end = end;
-				state->last_win = win_raw;
+				state->last_win = win;
 				state->retrans = 0;
 			}
 		}

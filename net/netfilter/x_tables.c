@@ -1392,7 +1392,7 @@ xt_replace_table(struct xt_table *table,
 	table->private = newinfo;
 
 	/* make sure all cpus see new ->private value */
-	smp_mb();
+	smp_wmb();
 
 	/*
 	 * Even though table entries have now been swapped, other CPU's
@@ -1556,9 +1556,6 @@ static void *xt_mttg_seq_next(struct seq_file *seq, void *v, loff_t *ppos,
 	uint8_t nfproto = (unsigned long)PDE_DATA(file_inode(seq->file));
 	struct nf_mttg_trav *trav = seq->private;
 
-	if (ppos != NULL)
-		++(*ppos);
-
 	switch (trav->class) {
 	case MTTG_TRAV_INIT:
 		trav->class = MTTG_TRAV_NFP_UNSPEC;
@@ -1584,6 +1581,9 @@ static void *xt_mttg_seq_next(struct seq_file *seq, void *v, loff_t *ppos,
 	default:
 		return NULL;
 	}
+
+	if (ppos != NULL)
+		++*ppos;
 	return trav;
 }
 

@@ -33,7 +33,7 @@ EXPORT_SYMBOL_GPL(nf_ipv6_ops);
 DEFINE_PER_CPU(bool, nf_skb_duplicated);
 EXPORT_SYMBOL_GPL(nf_skb_duplicated);
 
-#ifdef CONFIG_JUMP_LABEL
+#ifdef HAVE_JUMP_LABEL
 struct static_key nf_hooks_needed[NFPROTO_NUMPROTO][NF_MAX_HOOKS];
 EXPORT_SYMBOL(nf_hooks_needed);
 #endif
@@ -347,7 +347,7 @@ static int __nf_register_net_hook(struct net *net, int pf,
 	if (pf == NFPROTO_NETDEV && reg->hooknum == NF_NETDEV_INGRESS)
 		net_inc_ingress_queue();
 #endif
-#ifdef CONFIG_JUMP_LABEL
+#ifdef HAVE_JUMP_LABEL
 	static_key_slow_inc(&nf_hooks_needed[pf][reg->hooknum]);
 #endif
 	BUG_ON(p == new_hooks);
@@ -405,7 +405,7 @@ static void __nf_unregister_net_hook(struct net *net, int pf,
 		if (pf == NFPROTO_NETDEV && reg->hooknum == NF_NETDEV_INGRESS)
 			net_dec_ingress_queue();
 #endif
-#ifdef CONFIG_JUMP_LABEL
+#ifdef HAVE_JUMP_LABEL
 		static_key_slow_dec(&nf_hooks_needed[pf][reg->hooknum]);
 #endif
 	} else {
@@ -535,25 +535,6 @@ int nf_hook_slow(struct sk_buff *skb, struct nf_hook_state *state,
 }
 EXPORT_SYMBOL(nf_hook_slow);
 
-void nf_hook_slow_list(struct list_head *head, struct nf_hook_state *state,
-		       const struct nf_hook_entries *e)
-{
-	struct sk_buff *skb, *next;
-	struct list_head sublist;
-	int ret;
-
-	INIT_LIST_HEAD(&sublist);
-
-	list_for_each_entry_safe(skb, next, head, list) {
-		skb_list_del_init(skb);
-		ret = nf_hook_slow(skb, state, e, 0);
-		if (ret == 1)
-			list_add_tail(&skb->list, &sublist);
-	}
-	/* Put passed packets back on main list */
-	list_splice(&sublist, head);
-}
-EXPORT_SYMBOL(nf_hook_slow_list);
 
 int skb_make_writable(struct sk_buff *skb, unsigned int writable_len)
 {
