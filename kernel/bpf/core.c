@@ -273,8 +273,7 @@ static int bpf_adj_branches(struct bpf_prog *prog, u32 pos, u32 delta,
 			insn++;
 		}
 		code = insn->code;
-		if ((BPF_CLASS(code) != BPF_JMP &&
-		     BPF_CLASS(code) != BPF_JMP32) ||
+		if (BPF_CLASS(code) != BPF_JMP ||
 		    BPF_OP(code) == BPF_EXIT)
 			continue;
 		/* Adjust offset of jmps if we cross patch boundaries. */
@@ -371,7 +370,6 @@ void bpf_prog_kallsyms_del_all(struct bpf_prog *fp)
 int bpf_jit_enable   __read_mostly = IS_BUILTIN(CONFIG_BPF_JIT_ALWAYS_ON);
 int bpf_jit_harden   __read_mostly;
 int bpf_jit_kallsyms __read_mostly;
-long bpf_jit_limit   __read_mostly;
 
 static __always_inline void
 bpf_get_prog_addr_region(const struct bpf_prog *prog,
@@ -580,75 +578,27 @@ int bpf_get_kallsym(unsigned int symnum, unsigned long *value, char *type,
 	return ret;
 }
 
-static atomic_long_t bpf_jit_current;
-
-/* Can be overridden by an arch's JIT compiler if it has a custom,
- * dedicated BPF backend memory area, or if neither of the two
- * below apply.
- */
-u64 __weak bpf_jit_alloc_exec_limit(void)
-{
-#if defined(MODULES_VADDR)
-	return MODULES_END - MODULES_VADDR;
-#else
-	return VMALLOC_END - VMALLOC_START;
-#endif
-}
-
-static int __init bpf_jit_charge_init(void)
-{
-	/* Only used as heuristic here to derive limit. */
-	bpf_jit_limit = min_t(u64, round_up(bpf_jit_alloc_exec_limit() >> 2,
-					    PAGE_SIZE), LONG_MAX);
-	return 0;
-}
-pure_initcall(bpf_jit_charge_init);
-
-static int bpf_jit_charge_modmem(u32 pages)
-{
-	if (atomic_long_add_return(pages, &bpf_jit_current) >
-	    (bpf_jit_limit >> PAGE_SHIFT)) {
-		if (!capable(CAP_SYS_ADMIN)) {
-			atomic_long_sub(pages, &bpf_jit_current);
-			return -EPERM;
-		}
-	}
-
-	return 0;
-}
-
-static void bpf_jit_uncharge_modmem(u32 pages)
-{
-	atomic_long_sub(pages, &bpf_jit_current);
-}
-
 struct bpf_binary_header *
 bpf_jit_binary_alloc(unsigned int proglen, u8 **image_ptr,
 		     unsigned int alignment,
 		     bpf_jit_fill_hole_t bpf_fill_ill_insns)
 {
 	struct bpf_binary_header *hdr;
-	u32 size, hole, start, pages;
+	unsigned int size, hole, start;
 
 	/* Most of BPF filters are really small, but if some of them
 	 * fill a page, allow at least 128 extra bytes to insert a
 	 * random section of illegal instructions.
 	 */
 	size = round_up(proglen + sizeof(*hdr) + 128, PAGE_SIZE);
-	pages = size / PAGE_SIZE;
-
-	if (bpf_jit_charge_modmem(pages))
-		return NULL;
 	hdr = module_alloc(size);
-	if (!hdr) {
-		bpf_jit_uncharge_modmem(pages);
+	if (hdr == NULL)
 		return NULL;
-	}
 
 	/* Fill space with illegal/arch-dep instructions. */
 	bpf_fill_ill_insns(hdr, size);
 
-	hdr->pages = pages;
+	hdr->pages = size / PAGE_SIZE;
 	hole = min_t(unsigned int, size - (proglen + sizeof(*hdr)),
 		     PAGE_SIZE - sizeof(*hdr));
 	start = (get_random_int() % hole) & ~(alignment - 1);
@@ -661,10 +611,7 @@ bpf_jit_binary_alloc(unsigned int proglen, u8 **image_ptr,
 
 void bpf_jit_binary_free(struct bpf_binary_header *hdr)
 {
-	u32 pages = hdr->pages;
-
 	module_memfree(hdr);
-	bpf_jit_uncharge_modmem(pages);
 }
 
 /* This symbol is only overridden by archs that have different
@@ -770,27 +717,6 @@ static int bpf_jit_blind_insn(const struct bpf_insn *from,
 		*to++ = BPF_ALU64_IMM(BPF_MOV, BPF_REG_AX, imm_rnd ^ from->imm);
 		*to++ = BPF_ALU64_IMM(BPF_XOR, BPF_REG_AX, imm_rnd);
 		*to++ = BPF_JMP_REG(from->code, from->dst_reg, BPF_REG_AX, off);
-		break;
-
-	case BPF_JMP32 | BPF_JEQ  | BPF_K:
-	case BPF_JMP32 | BPF_JNE  | BPF_K:
-	case BPF_JMP32 | BPF_JGT  | BPF_K:
-	case BPF_JMP32 | BPF_JLT  | BPF_K:
-	case BPF_JMP32 | BPF_JGE  | BPF_K:
-	case BPF_JMP32 | BPF_JLE  | BPF_K:
-	case BPF_JMP32 | BPF_JSGT | BPF_K:
-	case BPF_JMP32 | BPF_JSLT | BPF_K:
-	case BPF_JMP32 | BPF_JSGE | BPF_K:
-	case BPF_JMP32 | BPF_JSLE | BPF_K:
-	case BPF_JMP32 | BPF_JSET | BPF_K:
-		/* Accommodate for extra offset in case of a backjump. */
-		off = from->off;
-		if (off < 0)
-			off -= 2;
-		*to++ = BPF_ALU32_IMM(BPF_MOV, BPF_REG_AX, imm_rnd ^ from->imm);
-		*to++ = BPF_ALU32_IMM(BPF_XOR, BPF_REG_AX, imm_rnd);
-		*to++ = BPF_JMP32_REG(from->code, from->dst_reg, BPF_REG_AX,
-				      off);
 		break;
 
 	case BPF_LD | BPF_IMM | BPF_DW:
@@ -987,31 +913,6 @@ EXPORT_SYMBOL_GPL(__bpf_call_base);
 	INSN_2(JMP, CALL),			\
 	/* Exit instruction. */			\
 	INSN_2(JMP, EXIT),			\
-	/* 32-bit Jump instructions. */		\
-	/*   Register based. */			\
-	INSN_3(JMP32, JEQ,  X),			\
-	INSN_3(JMP32, JNE,  X),			\
-	INSN_3(JMP32, JGT,  X),			\
-	INSN_3(JMP32, JLT,  X),			\
-	INSN_3(JMP32, JGE,  X),			\
-	INSN_3(JMP32, JLE,  X),			\
-	INSN_3(JMP32, JSGT, X),			\
-	INSN_3(JMP32, JSLT, X),			\
-	INSN_3(JMP32, JSGE, X),			\
-	INSN_3(JMP32, JSLE, X),			\
-	INSN_3(JMP32, JSET, X),			\
-	/*   Immediate based. */		\
-	INSN_3(JMP32, JEQ,  K),			\
-	INSN_3(JMP32, JNE,  K),			\
-	INSN_3(JMP32, JGT,  K),			\
-	INSN_3(JMP32, JLT,  K),			\
-	INSN_3(JMP32, JGE,  K),			\
-	INSN_3(JMP32, JLE,  K),			\
-	INSN_3(JMP32, JSGT, K),			\
-	INSN_3(JMP32, JSLT, K),			\
-	INSN_3(JMP32, JSGE, K),			\
-	INSN_3(JMP32, JSLE, K),			\
-	INSN_3(JMP32, JSET, K),			\
 	/* Jump instructions. */		\
 	/*   Register based. */			\
 	INSN_3(JMP, JEQ,  X),			\
@@ -1266,49 +1167,145 @@ select_insn:
 out:
 		CONT;
 	}
+	/* JMP */
 	JMP_JA:
 		insn += insn->off;
 		CONT;
+	JMP_JEQ_X:
+		if (DST == SRC) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JEQ_K:
+		if (DST == IMM) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JNE_X:
+		if (DST != SRC) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JNE_K:
+		if (DST != IMM) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JGT_X:
+		if (DST > SRC) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JGT_K:
+		if (DST > IMM) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JLT_X:
+		if (DST < SRC) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JLT_K:
+		if (DST < IMM) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JGE_X:
+		if (DST >= SRC) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JGE_K:
+		if (DST >= IMM) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JLE_X:
+		if (DST <= SRC) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JLE_K:
+		if (DST <= IMM) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JSGT_X:
+		if (((s64) DST) > ((s64) SRC)) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JSGT_K:
+		if (((s64) DST) > ((s64) IMM)) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JSLT_X:
+		if (((s64) DST) < ((s64) SRC)) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JSLT_K:
+		if (((s64) DST) < ((s64) IMM)) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JSGE_X:
+		if (((s64) DST) >= ((s64) SRC)) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JSGE_K:
+		if (((s64) DST) >= ((s64) IMM)) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JSLE_X:
+		if (((s64) DST) <= ((s64) SRC)) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JSLE_K:
+		if (((s64) DST) <= ((s64) IMM)) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JSET_X:
+		if (DST & SRC) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
+	JMP_JSET_K:
+		if (DST & IMM) {
+			insn += insn->off;
+			CONT_JMP;
+		}
+		CONT;
 	JMP_EXIT:
 		return BPF_R0;
-	/* JMP */
-#define COND_JMP(SIGN, OPCODE, CMP_OP)				\
-	JMP_##OPCODE##_X:					\
-		if ((SIGN##64) DST CMP_OP (SIGN##64) SRC) {	\
-			insn += insn->off;			\
-			CONT_JMP;				\
-		}						\
-		CONT;						\
-	JMP32_##OPCODE##_X:					\
-		if ((SIGN##32) DST CMP_OP (SIGN##32) SRC) {	\
-			insn += insn->off;			\
-			CONT_JMP;				\
-		}						\
-		CONT;						\
-	JMP_##OPCODE##_K:					\
-		if ((SIGN##64) DST CMP_OP (SIGN##64) IMM) {	\
-			insn += insn->off;			\
-			CONT_JMP;				\
-		}						\
-		CONT;						\
-	JMP32_##OPCODE##_K:					\
-		if ((SIGN##32) DST CMP_OP (SIGN##32) IMM) {	\
-			insn += insn->off;			\
-			CONT_JMP;				\
-		}						\
-		CONT;
-	COND_JMP(u, JEQ, ==)
-	COND_JMP(u, JNE, !=)
-	COND_JMP(u, JGT, >)
-	COND_JMP(u, JLT, <)
-	COND_JMP(u, JGE, >=)
-	COND_JMP(u, JLE, <=)
-	COND_JMP(u, JSET, &)
-	COND_JMP(s, JSGT, >)
-	COND_JMP(s, JSLT, <)
-	COND_JMP(s, JSGE, >=)
-	COND_JMP(s, JSLE, <=)
-#undef COND_JMP
+
 	/* STX and ST and LDX*/
 #define LDST(SIZEOP, SIZE)						\
 	STX_MEM_##SIZEOP:						\

@@ -163,6 +163,10 @@ static inline void free_task_struct(struct task_struct *tsk)
 }
 #endif
 
+void __weak arch_release_thread_stack(unsigned long *stack)
+{
+}
+
 #ifndef CONFIG_ARCH_THREAD_STACK_ALLOCATOR
 
 /*
@@ -216,7 +220,6 @@ static unsigned long *alloc_thread_stack_node(struct task_struct *tsk, int node)
 		memset(s->addr, 0, THREAD_SIZE);
 
 		tsk->stack_vm_area = s;
-		tsk->stack = s->addr;
 		return s->addr;
 	}
 
@@ -231,20 +234,14 @@ static unsigned long *alloc_thread_stack_node(struct task_struct *tsk, int node)
 	 * free_thread_stack() can be called in interrupt context,
 	 * so cache the vm_struct.
 	 */
-	if (stack) {
+	if (stack)
 		tsk->stack_vm_area = find_vm_area(stack);
-		tsk->stack = stack;
-	}
 	return stack;
 #else
 	struct page *page = alloc_pages_node(node, THREADINFO_GFP,
 					     THREAD_SIZE_ORDER);
 
-	if (likely(page)) {
-		tsk->stack = page_address(page);
-		return tsk->stack;
-	}
-	return NULL;
+	return page ? page_address(page) : NULL;
 #endif
 }
 
@@ -275,10 +272,7 @@ static struct kmem_cache *thread_stack_cache;
 static unsigned long *alloc_thread_stack_node(struct task_struct *tsk,
 						  int node)
 {
-	unsigned long *stack;
-	stack = kmem_cache_alloc_node(thread_stack_cache, THREADINFO_GFP, node);
-	tsk->stack = stack;
-	return stack;
+	return kmem_cache_alloc_node(thread_stack_cache, THREADINFO_GFP, node);
 }
 
 static void free_thread_stack(struct task_struct *tsk)
@@ -382,6 +376,7 @@ static void release_task_stack(struct task_struct *tsk)
 		return;  /* Better to leak the stack than to free prematurely */
 
 	account_kernel_stack(tsk, -1);
+	arch_release_thread_stack(tsk->stack);
 	free_thread_stack(tsk);
 	tsk->stack = NULL;
 #ifdef CONFIG_VMAP_STACK
@@ -684,7 +679,7 @@ void __put_task_struct(struct task_struct *tsk)
 	WARN_ON(tsk == current);
 
 	cgroup_free(tsk);
-	task_numa_free(tsk, true);
+	task_numa_free(tsk);
 	security_task_free(tsk);
 	exit_creds(tsk);
 	delayacct_tsk_free(tsk);
@@ -909,15 +904,6 @@ static void mm_init_aio(struct mm_struct *mm)
 #ifdef CONFIG_AIO
 	spin_lock_init(&mm->ioctx_lock);
 	mm->ioctx_table = NULL;
-#endif
-}
-
-static __always_inline void mm_clear_owner(struct mm_struct *mm,
-					   struct task_struct *p)
-{
-#ifdef CONFIG_MEMCG
-	if (mm->owner == p)
-		WRITE_ONCE(mm->owner, NULL);
 #endif
 }
 
@@ -1300,7 +1286,6 @@ static struct mm_struct *dup_mm(struct task_struct *tsk)
 free_pt:
 	/* don't put binfmt in mmput, we haven't got module yet */
 	mm->binfmt = NULL;
-	mm_init_owner(mm, NULL);
 	mmput(mm);
 
 fail_nomem:
@@ -1630,40 +1615,6 @@ static inline void rcu_copy_process(struct task_struct *p)
 	INIT_LIST_HEAD(&p->rcu_tasks_holdout_list);
 	p->rcu_tasks_idle_cpu = -1;
 #endif /* #ifdef CONFIG_TASKS_RCU */
-}
-
-static void __delayed_free_task(struct rcu_head *rhp)
-{
-	struct task_struct *tsk = container_of(rhp, struct task_struct, rcu);
-
-	free_task(tsk);
-}
-
-static __always_inline void delayed_free_task(struct task_struct *tsk)
-{
-	if (IS_ENABLED(CONFIG_MEMCG))
-		call_rcu(&tsk->rcu, __delayed_free_task);
-	else
-		free_task(tsk);
-}
-
-static void copy_oom_score_adj(u64 clone_flags, struct task_struct *tsk)
-{
-	/* Skip if kernel thread */
-	if (!tsk->mm)
-		return;
-
-	/* Skip if spawning a thread or using vfork */
-	if ((clone_flags & (CLONE_VM | CLONE_THREAD | CLONE_VFORK)) != CLONE_VM)
-		return;
-
-	/* We need to synchronize with __set_oom_adj */
-	mutex_lock(&oom_adj_mutex);
-	set_bit(MMF_MULTIPROCESS, &tsk->mm->flags);
-	/* Update the values in case they were changed after copy_signal */
-	tsk->signal->oom_score_adj = current->signal->oom_score_adj;
-	tsk->signal->oom_score_adj_min = current->signal->oom_score_adj_min;
-	mutex_unlock(&oom_adj_mutex);
 }
 
 /*
@@ -2103,8 +2054,6 @@ static __latent_entropy struct task_struct *copy_process(
 	trace_task_newtask(p, clone_flags);
 	uprobe_copy_process(p, clone_flags);
 
-	copy_oom_score_adj(clone_flags, p);
-
 	return p;
 
 bad_fork_cancel_cgroup:
@@ -2123,10 +2072,8 @@ bad_fork_cleanup_io:
 bad_fork_cleanup_namespaces:
 	exit_task_namespaces(p);
 bad_fork_cleanup_mm:
-	if (p->mm) {
-		mm_clear_owner(p->mm, p);
+	if (p->mm)
 		mmput(p->mm);
-	}
 bad_fork_cleanup_signal:
 	if (!(clone_flags & CLONE_THREAD))
 		free_signal_struct(p->signal);
@@ -2157,7 +2104,7 @@ bad_fork_cleanup_count:
 bad_fork_free:
 	p->state = TASK_DEAD;
 	put_task_stack(p);
-	delayed_free_task(p);
+	free_task(p);
 fork_out:
 	spin_lock_irq(&current->sighand->siglock);
 	hlist_del_init(&delayed.node);
@@ -2649,7 +2596,7 @@ int sysctl_max_threads(struct ctl_table *table, int write,
 	struct ctl_table t;
 	int ret;
 	int threads = max_threads;
-	int min = 1;
+	int min = MIN_THREADS;
 	int max = MAX_THREADS;
 
 	t = *table;
@@ -2661,7 +2608,7 @@ int sysctl_max_threads(struct ctl_table *table, int write,
 	if (ret || !write)
 		return ret;
 
-	max_threads = threads;
+	set_max_threads(threads);
 
 	return 0;
 }
