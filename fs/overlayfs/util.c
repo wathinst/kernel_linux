@@ -479,32 +479,7 @@ bool ovl_is_whiteout(struct dentry *dentry)
 
 struct file *ovl_path_open(struct path *path, int flags)
 {
-	struct inode *inode = d_inode(path->dentry);
-	int err, acc_mode;
-
-	if (flags & ~(O_ACCMODE | O_LARGEFILE))
-		BUG();
-
-	switch (flags & O_ACCMODE) {
-	case O_RDONLY:
-		acc_mode = MAY_READ;
-		break;
-	case O_WRONLY:
-		acc_mode = MAY_WRITE;
-		break;
-	default:
-		BUG();
-	}
-
-	err = inode_permission(inode, acc_mode | MAY_OPEN);
-	if (err)
-		return ERR_PTR(err);
-
-	/* O_NOATIME is an optimization, don't fail if not permitted */
-	if (inode_owner_or_capable(inode))
-		flags |= O_NOATIME;
-
-	return dentry_open(path, flags, current_cred());
+	return dentry_open(path, flags | O_NOATIME, current_cred());
 }
 
 /* Caller should hold ovl_inode->lock */
@@ -676,18 +651,6 @@ void ovl_inuse_unlock(struct dentry *dentry)
 		inode->i_state &= ~I_OVL_INUSE;
 		spin_unlock(&inode->i_lock);
 	}
-}
-
-bool ovl_is_inuse(struct dentry *dentry)
-{
-	struct inode *inode = d_inode(dentry);
-	bool inuse;
-
-	spin_lock(&inode->i_lock);
-	inuse = (inode->i_state & I_OVL_INUSE);
-	spin_unlock(&inode->i_lock);
-
-	return inuse;
 }
 
 /*

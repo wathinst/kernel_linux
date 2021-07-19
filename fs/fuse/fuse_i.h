@@ -118,8 +118,6 @@ enum {
 	FUSE_I_INIT_RDPLUS,
 	/** An operation changing file size is in progress  */
 	FUSE_I_SIZE_UNSTABLE,
-	/* Bad inode */
-	FUSE_I_BAD,
 };
 
 struct fuse_conn;
@@ -389,9 +387,6 @@ struct fuse_req {
 struct fuse_iqueue {
 	/** Connection established */
 	unsigned connected;
-
-	/** Lock protecting accesses to members of this structure */
-	spinlock_t lock;
 
 	/** Readers of the connection are waiting on this */
 	wait_queue_head_t waitq;
@@ -702,17 +697,6 @@ static inline u64 get_node_id(struct inode *inode)
 	return get_fuse_inode(inode)->nodeid;
 }
 
-static inline void fuse_make_bad(struct inode *inode)
-{
-	remove_inode_hash(inode);
-	set_bit(FUSE_I_BAD, &get_fuse_inode(inode)->state);
-}
-
-static inline bool fuse_is_bad(struct inode *inode)
-{
-	return unlikely(test_bit(FUSE_I_BAD, &get_fuse_inode(inode)->state));
-}
-
 /** Device operations */
 extern const struct file_operations fuse_dev_operations;
 
@@ -921,8 +905,6 @@ void fuse_ctl_remove_conn(struct fuse_conn *fc);
  * Is file type valid?
  */
 int fuse_valid_type(int m);
-
-bool fuse_invalid_attr(struct fuse_attr *attr);
 
 /**
  * Is current process allowed to perform filesystem operation?

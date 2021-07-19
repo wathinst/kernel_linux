@@ -448,341 +448,6 @@ static int check_block_group_item(struct btrfs_fs_info *fs_info,
 	return 0;
 }
 
-__printf(3,4)
-__cold
-static void extent_err(const struct extent_buffer *eb, int slot,
-		       const char *fmt, ...)
-{
-	struct btrfs_key key;
-	struct va_format vaf;
-	va_list args;
-	u64 bytenr;
-	u64 len;
-
-	btrfs_item_key_to_cpu(eb, &key, slot);
-	bytenr = key.objectid;
-	if (key.type == BTRFS_METADATA_ITEM_KEY)
-		len = eb->fs_info->nodesize;
-	else
-		len = key.offset;
-	va_start(args, fmt);
-
-	vaf.fmt = fmt;
-	vaf.va = &args;
-
-	btrfs_crit(eb->fs_info,
-	"corrupt %s: block=%llu slot=%d extent bytenr=%llu len=%llu %pV",
-		btrfs_header_level(eb) == 0 ? "leaf" : "node",
-		eb->start, slot, bytenr, len, &vaf);
-	va_end(args);
-}
-
-static int check_extent_item(struct extent_buffer *leaf,
-			     struct btrfs_key *key, int slot)
-{
-	struct btrfs_fs_info *fs_info = leaf->fs_info;
-	struct btrfs_extent_item *ei;
-	bool is_tree_block = false;
-	unsigned long ptr;	/* Current pointer inside inline refs */
-	unsigned long end;	/* Extent item end */
-	const u32 item_size = btrfs_item_size_nr(leaf, slot);
-	u64 flags;
-	u64 generation;
-	u64 total_refs;		/* Total refs in btrfs_extent_item */
-	u64 inline_refs = 0;	/* found total inline refs */
-
-	if (key->type == BTRFS_METADATA_ITEM_KEY &&
-	    !btrfs_fs_incompat(fs_info, SKINNY_METADATA)) {
-		generic_err(fs_info, leaf, slot,
-"invalid key type, METADATA_ITEM type invalid when SKINNY_METADATA feature disabled");
-		return -EUCLEAN;
-	}
-	/* key->objectid is the bytenr for both key types */
-	if (!IS_ALIGNED(key->objectid, fs_info->sectorsize)) {
-		generic_err(fs_info, leaf, slot,
-		"invalid key objectid, have %llu expect to be aligned to %u",
-			   key->objectid, fs_info->sectorsize);
-		return -EUCLEAN;
-	}
-
-	/* key->offset is tree level for METADATA_ITEM_KEY */
-	if (key->type == BTRFS_METADATA_ITEM_KEY &&
-	    key->offset >= BTRFS_MAX_LEVEL) {
-		extent_err(leaf, slot,
-			   "invalid tree level, have %llu expect [0, %u]",
-			   key->offset, BTRFS_MAX_LEVEL - 1);
-		return -EUCLEAN;
-	}
-
-	/*
-	 * EXTENT/METADATA_ITEM consists of:
-	 * 1) One btrfs_extent_item
-	 *    Records the total refs, type and generation of the extent.
-	 *
-	 * 2) One btrfs_tree_block_info (for EXTENT_ITEM and tree backref only)
-	 *    Records the first key and level of the tree block.
-	 *
-	 * 2) Zero or more btrfs_extent_inline_ref(s)
-	 *    Each inline ref has one btrfs_extent_inline_ref shows:
-	 *    2.1) The ref type, one of the 4
-	 *         TREE_BLOCK_REF	Tree block only
-	 *         SHARED_BLOCK_REF	Tree block only
-	 *         EXTENT_DATA_REF	Data only
-	 *         SHARED_DATA_REF	Data only
-	 *    2.2) Ref type specific data
-	 *         Either using btrfs_extent_inline_ref::offset, or specific
-	 *         data structure.
-	 */
-	if (item_size < sizeof(*ei)) {
-		extent_err(leaf, slot,
-			   "invalid item size, have %u expect [%zu, %u)",
-			   item_size, sizeof(*ei),
-			   BTRFS_LEAF_DATA_SIZE(fs_info));
-		return -EUCLEAN;
-	}
-	end = item_size + btrfs_item_ptr_offset(leaf, slot);
-
-	/* Checks against extent_item */
-	ei = btrfs_item_ptr(leaf, slot, struct btrfs_extent_item);
-	flags = btrfs_extent_flags(leaf, ei);
-	total_refs = btrfs_extent_refs(leaf, ei);
-	generation = btrfs_extent_generation(leaf, ei);
-	if (generation > btrfs_super_generation(fs_info->super_copy) + 1) {
-		extent_err(leaf, slot,
-			   "invalid generation, have %llu expect (0, %llu]",
-			   generation,
-			   btrfs_super_generation(fs_info->super_copy) + 1);
-		return -EUCLEAN;
-	}
-	if (!is_power_of_2(flags & (BTRFS_EXTENT_FLAG_DATA |
-				    BTRFS_EXTENT_FLAG_TREE_BLOCK))) {
-		extent_err(leaf, slot,
-		"invalid extent flag, have 0x%llx expect 1 bit set in 0x%llx",
-			flags, BTRFS_EXTENT_FLAG_DATA |
-			BTRFS_EXTENT_FLAG_TREE_BLOCK);
-		return -EUCLEAN;
-	}
-	is_tree_block = !!(flags & BTRFS_EXTENT_FLAG_TREE_BLOCK);
-	if (is_tree_block) {
-		if (key->type == BTRFS_EXTENT_ITEM_KEY &&
-		    key->offset != fs_info->nodesize) {
-			extent_err(leaf, slot,
-				   "invalid extent length, have %llu expect %u",
-				   key->offset, fs_info->nodesize);
-			return -EUCLEAN;
-		}
-	} else {
-		if (key->type != BTRFS_EXTENT_ITEM_KEY) {
-			extent_err(leaf, slot,
-			"invalid key type, have %u expect %u for data backref",
-				   key->type, BTRFS_EXTENT_ITEM_KEY);
-			return -EUCLEAN;
-		}
-		if (!IS_ALIGNED(key->offset, fs_info->sectorsize)) {
-			extent_err(leaf, slot,
-			"invalid extent length, have %llu expect aligned to %u",
-				   key->offset, fs_info->sectorsize);
-			return -EUCLEAN;
-		}
-	}
-	ptr = (unsigned long)(struct btrfs_extent_item *)(ei + 1);
-
-	/* Check the special case of btrfs_tree_block_info */
-	if (is_tree_block && key->type != BTRFS_METADATA_ITEM_KEY) {
-		struct btrfs_tree_block_info *info;
-
-		info = (struct btrfs_tree_block_info *)ptr;
-		if (btrfs_tree_block_level(leaf, info) >= BTRFS_MAX_LEVEL) {
-			extent_err(leaf, slot,
-			"invalid tree block info level, have %u expect [0, %u]",
-				   btrfs_tree_block_level(leaf, info),
-				   BTRFS_MAX_LEVEL - 1);
-			return -EUCLEAN;
-		}
-		ptr = (unsigned long)(struct btrfs_tree_block_info *)(info + 1);
-	}
-
-	/* Check inline refs */
-	while (ptr < end) {
-		struct btrfs_extent_inline_ref *iref;
-		struct btrfs_extent_data_ref *dref;
-		struct btrfs_shared_data_ref *sref;
-		u64 dref_offset;
-		u64 inline_offset;
-		u8 inline_type;
-
-		if (ptr + sizeof(*iref) > end) {
-			extent_err(leaf, slot,
-"inline ref item overflows extent item, ptr %lu iref size %zu end %lu",
-				   ptr, sizeof(*iref), end);
-			return -EUCLEAN;
-		}
-		iref = (struct btrfs_extent_inline_ref *)ptr;
-		inline_type = btrfs_extent_inline_ref_type(leaf, iref);
-		inline_offset = btrfs_extent_inline_ref_offset(leaf, iref);
-		if (ptr + btrfs_extent_inline_ref_size(inline_type) > end) {
-			extent_err(leaf, slot,
-"inline ref item overflows extent item, ptr %lu iref size %u end %lu",
-				   ptr, inline_type, end);
-			return -EUCLEAN;
-		}
-
-		switch (inline_type) {
-		/* inline_offset is subvolid of the owner, no need to check */
-		case BTRFS_TREE_BLOCK_REF_KEY:
-			inline_refs++;
-			break;
-		/* Contains parent bytenr */
-		case BTRFS_SHARED_BLOCK_REF_KEY:
-			if (!IS_ALIGNED(inline_offset, fs_info->sectorsize)) {
-				extent_err(leaf, slot,
-		"invalid tree parent bytenr, have %llu expect aligned to %u",
-					   inline_offset, fs_info->sectorsize);
-				return -EUCLEAN;
-			}
-			inline_refs++;
-			break;
-		/*
-		 * Contains owner subvolid, owner key objectid, adjusted offset.
-		 * The only obvious corruption can happen in that offset.
-		 */
-		case BTRFS_EXTENT_DATA_REF_KEY:
-			dref = (struct btrfs_extent_data_ref *)(&iref->offset);
-			dref_offset = btrfs_extent_data_ref_offset(leaf, dref);
-			if (!IS_ALIGNED(dref_offset, fs_info->sectorsize)) {
-				extent_err(leaf, slot,
-		"invalid data ref offset, have %llu expect aligned to %u",
-					   dref_offset, fs_info->sectorsize);
-				return -EUCLEAN;
-			}
-			inline_refs += btrfs_extent_data_ref_count(leaf, dref);
-			break;
-		/* Contains parent bytenr and ref count */
-		case BTRFS_SHARED_DATA_REF_KEY:
-			sref = (struct btrfs_shared_data_ref *)(iref + 1);
-			if (!IS_ALIGNED(inline_offset, fs_info->sectorsize)) {
-				extent_err(leaf, slot,
-		"invalid data parent bytenr, have %llu expect aligned to %u",
-					   inline_offset, fs_info->sectorsize);
-				return -EUCLEAN;
-			}
-			inline_refs += btrfs_shared_data_ref_count(leaf, sref);
-			break;
-		default:
-			extent_err(leaf, slot, "unknown inline ref type: %u",
-				   inline_type);
-			return -EUCLEAN;
-		}
-		ptr += btrfs_extent_inline_ref_size(inline_type);
-	}
-	/* No padding is allowed */
-	if (ptr != end) {
-		extent_err(leaf, slot,
-			   "invalid extent item size, padding bytes found");
-		return -EUCLEAN;
-	}
-
-	/* Finally, check the inline refs against total refs */
-	if (inline_refs > total_refs) {
-		extent_err(leaf, slot,
-			"invalid extent refs, have %llu expect >= inline %llu",
-			   total_refs, inline_refs);
-		return -EUCLEAN;
-	}
-	return 0;
-}
-
-/* Inode item error output has the same format as dir_item_err() */
-#define inode_item_err(fs_info, eb, slot, fmt, ...)			\
-	dir_item_err(fs_info, eb, slot, fmt, __VA_ARGS__)
-
-static int check_inode_item(struct btrfs_fs_info *fs_info,
-			    struct extent_buffer *leaf,
-			    struct btrfs_key *key, int slot)
-{
-	struct btrfs_inode_item *iitem;
-	u64 super_gen = btrfs_super_generation(fs_info->super_copy);
-	u32 valid_mask = (S_IFMT | S_ISUID | S_ISGID | S_ISVTX | 0777);
-	u32 mode;
-
-	if ((key->objectid < BTRFS_FIRST_FREE_OBJECTID ||
-	     key->objectid > BTRFS_LAST_FREE_OBJECTID) &&
-	    key->objectid != BTRFS_ROOT_TREE_DIR_OBJECTID &&
-	    key->objectid != BTRFS_FREE_INO_OBJECTID) {
-		generic_err(fs_info, leaf, slot,
-	"invalid key objectid: has %llu expect %llu or [%llu, %llu] or %llu",
-			    key->objectid, BTRFS_ROOT_TREE_DIR_OBJECTID,
-			    BTRFS_FIRST_FREE_OBJECTID,
-			    BTRFS_LAST_FREE_OBJECTID,
-			    BTRFS_FREE_INO_OBJECTID);
-		return -EUCLEAN;
-	}
-	if (key->offset != 0) {
-		inode_item_err(fs_info, leaf, slot,
-			"invalid key offset: has %llu expect 0",
-			key->offset);
-		return -EUCLEAN;
-	}
-	iitem = btrfs_item_ptr(leaf, slot, struct btrfs_inode_item);
-
-	/* Here we use super block generation + 1 to handle log tree */
-	if (btrfs_inode_generation(leaf, iitem) > super_gen + 1) {
-		inode_item_err(fs_info, leaf, slot,
-			"invalid inode generation: has %llu expect (0, %llu]",
-			       btrfs_inode_generation(leaf, iitem),
-			       super_gen + 1);
-		return -EUCLEAN;
-	}
-	/* Note for ROOT_TREE_DIR_ITEM, mkfs could set its transid 0 */
-	if (btrfs_inode_transid(leaf, iitem) > super_gen + 1) {
-		inode_item_err(fs_info, leaf, slot,
-			"invalid inode generation: has %llu expect [0, %llu]",
-			       btrfs_inode_transid(leaf, iitem), super_gen + 1);
-		return -EUCLEAN;
-	}
-
-	/*
-	 * For size and nbytes it's better not to be too strict, as for dir
-	 * item its size/nbytes can easily get wrong, but doesn't affect
-	 * anything in the fs. So here we skip the check.
-	 */
-	mode = btrfs_inode_mode(leaf, iitem);
-	if (mode & ~valid_mask) {
-		inode_item_err(fs_info, leaf, slot,
-			       "unknown mode bit detected: 0x%x",
-			       mode & ~valid_mask);
-		return -EUCLEAN;
-	}
-
-	/*
-	 * S_IFMT is not bit mapped so we can't completely rely on is_power_of_2,
-	 * but is_power_of_2() can save us from checking FIFO/CHR/DIR/REG.
-	 * Only needs to check BLK, LNK and SOCKS
-	 */
-	if (!is_power_of_2(mode & S_IFMT)) {
-		if (!S_ISLNK(mode) && !S_ISBLK(mode) && !S_ISSOCK(mode)) {
-			inode_item_err(fs_info, leaf, slot,
-			"invalid mode: has 0%o expect valid S_IF* bit(s)",
-				       mode & S_IFMT);
-			return -EUCLEAN;
-		}
-	}
-	if (S_ISDIR(mode) && btrfs_inode_nlink(leaf, iitem) > 1) {
-		inode_item_err(fs_info, leaf, slot,
-		       "invalid nlink: has %u expect no more than 1 for dir",
-			btrfs_inode_nlink(leaf, iitem));
-		return -EUCLEAN;
-	}
-	if (btrfs_inode_flags(leaf, iitem) & ~BTRFS_INODE_FLAG_MASK) {
-		inode_item_err(fs_info, leaf, slot,
-			       "unknown flags detected: 0x%llx",
-			       btrfs_inode_flags(leaf, iitem) &
-			       ~BTRFS_INODE_FLAG_MASK);
-		return -EUCLEAN;
-	}
-	return 0;
-}
-
 /*
  * Common point to switch the item-specific validation.
  */
@@ -807,13 +472,6 @@ static int check_leaf_item(struct btrfs_fs_info *fs_info,
 	case BTRFS_BLOCK_GROUP_ITEM_KEY:
 		ret = check_block_group_item(fs_info, leaf, key, slot);
 		break;
-	case BTRFS_EXTENT_ITEM_KEY:
-	case BTRFS_METADATA_ITEM_KEY:
-		ret = check_extent_item(leaf, key, slot);
-		break;
-	case BTRFS_INODE_ITEM_KEY:
-		ret = check_inode_item(fs_info, leaf, key, slot);
-		break;
 	}
 	return ret;
 }
@@ -827,13 +485,6 @@ static int check_leaf(struct btrfs_fs_info *fs_info, struct extent_buffer *leaf,
 	u32 nritems = btrfs_header_nritems(leaf);
 	int slot;
 
-	if (btrfs_header_level(leaf) != 0) {
-		generic_err(fs_info, leaf, 0,
-			"invalid level for leaf, have %d expect 0",
-			btrfs_header_level(leaf));
-		return -EUCLEAN;
-	}
-
 	/*
 	 * Extent buffers from a relocation tree have a owner field that
 	 * corresponds to the subvolume tree they are based on. So just from an
@@ -844,6 +495,7 @@ static int check_leaf(struct btrfs_fs_info *fs_info, struct extent_buffer *leaf,
 	 */
 	if (nritems == 0 && !btrfs_header_flag(leaf, BTRFS_HEADER_FLAG_RELOC)) {
 		u64 owner = btrfs_header_owner(leaf);
+		struct btrfs_root *check_root;
 
 		/* These trees must never be empty */
 		if (owner == BTRFS_ROOT_TREE_OBJECTID ||
@@ -857,11 +509,28 @@ static int check_leaf(struct btrfs_fs_info *fs_info, struct extent_buffer *leaf,
 				    owner);
 			return -EUCLEAN;
 		}
-		/* Unknown tree */
-		if (owner == 0) {
-			generic_err(fs_info, leaf, 0,
-				"invalid owner, root 0 is not defined");
-			return -EUCLEAN;
+		key.objectid = owner;
+		key.type = BTRFS_ROOT_ITEM_KEY;
+		key.offset = (u64)-1;
+
+		check_root = btrfs_get_fs_root(fs_info, &key, false);
+		/*
+		 * The only reason we also check NULL here is that during
+		 * open_ctree() some roots has not yet been set up.
+		 */
+		if (!IS_ERR_OR_NULL(check_root)) {
+			struct extent_buffer *eb;
+
+			eb = btrfs_root_node(check_root);
+			/* if leaf is the root, then it's fine */
+			if (leaf != eb) {
+				generic_err(fs_info, leaf, 0,
+		"invalid nritems, have %u should not be 0 for non-root leaf",
+					nritems);
+				free_extent_buffer(eb);
+				return -EUCLEAN;
+			}
+			free_extent_buffer(eb);
 		}
 		return 0;
 	}
@@ -974,16 +643,9 @@ int btrfs_check_node(struct btrfs_fs_info *fs_info, struct extent_buffer *node)
 	unsigned long nr = btrfs_header_nritems(node);
 	struct btrfs_key key, next_key;
 	int slot;
-	int level = btrfs_header_level(node);
 	u64 bytenr;
 	int ret = 0;
 
-	if (level <= 0 || level >= BTRFS_MAX_LEVEL) {
-		generic_err(fs_info, node, 0,
-			"invalid level for node, have %d expect [1, %d]",
-			level, BTRFS_MAX_LEVEL - 1);
-		return -EUCLEAN;
-	}
 	if (nr == 0 || nr > BTRFS_NODEPTRS_PER_BLOCK(fs_info)) {
 		btrfs_crit(fs_info,
 "corrupt node: root=%llu block=%llu, nritems too %s, have %lu expect range [1,%u]",

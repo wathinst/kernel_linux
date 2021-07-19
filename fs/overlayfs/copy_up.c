@@ -43,7 +43,7 @@ int ovl_copy_xattr(struct dentry *old, struct dentry *new)
 {
 	ssize_t list_size, size, value_size = 0;
 	char *buf, *name, *value = NULL;
-	int error = 0;
+	int uninitialized_var(error);
 	size_t slen;
 
 	if (!(old->d_inode->i_opflags & IOP_XATTR) ||
@@ -878,14 +878,14 @@ static bool ovl_open_need_copy_up(struct dentry *dentry, int flags)
 	return true;
 }
 
-int ovl_maybe_copy_up(struct dentry *dentry, int flags)
+int ovl_open_maybe_copy_up(struct dentry *dentry, unsigned int file_flags)
 {
 	int err = 0;
 
-	if (ovl_open_need_copy_up(dentry, flags)) {
+	if (ovl_open_need_copy_up(dentry, file_flags)) {
 		err = ovl_want_write(dentry);
 		if (!err) {
-			err = ovl_copy_up_flags(dentry, flags);
+			err = ovl_copy_up_flags(dentry, file_flags);
 			ovl_drop_write(dentry);
 		}
 	}
