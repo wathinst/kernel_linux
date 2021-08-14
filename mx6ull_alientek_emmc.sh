@@ -2,4 +2,5 @@
 make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- distclean
 # make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- imx_v7_defconfig
 make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- imx6ull_defconfig
+# make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- menuconfig
 make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- all -j16
